@@ -4,7 +4,7 @@ A reinforcement learning bot that plays Pokemon Showdown Gen 9 Random Battles us
 
 ## Project Status
 
-**Current Phase**: Phase 2 - Core ML Pipeline (Complete)
+**Current Phase**: Phase 3 - Self-Play System (Complete)
 **Last Updated**: 2026-01-07
 
 ### Progress Tracker
@@ -29,9 +29,10 @@ A reinforcement learning bot that plays Pokemon Showdown Gen 9 Random Battles us
 - [x] Checkpoint saving/loading
 
 #### Phase 3: Self-Play System
-- [ ] Implement self-play manager
-- [ ] Opponent pool with historical checkpoints
-- [ ] Elo rating tracking
+- [x] Implement self-play manager
+- [x] Opponent pool with historical checkpoints
+- [x] Elo rating tracking
+- [x] Comprehensive test suite (state encoder, network, PPO, buffer, integration)
 - [ ] Parallel environment support
 - [ ] Curriculum learning
 
@@ -128,7 +129,21 @@ tensorboard --logdir runs/
 - `src/showdown_bot/config.py` - All hyperparameters
 - `src/showdown_bot/models/network.py` - Neural network
 - `src/showdown_bot/training/ppo.py` - PPO implementation
+- `src/showdown_bot/training/self_play.py` - Self-play manager and opponent pool
+- `src/showdown_bot/evaluation/elo.py` - Elo rating system
 - `src/showdown_bot/environment/state_encoder.py` - State encoding
+
+### Running Tests
+```bash
+# Run all tests
+pytest tests/
+
+# Run specific test file
+pytest tests/test_network.py
+
+# Run with coverage
+pytest tests/ --cov=showdown_bot
+```
 
 ### Environment Variables
 - `SHOWDOWN_SERVER` - Pokemon Showdown server URL (default: localhost:8000)
