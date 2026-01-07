@@ -4,7 +4,7 @@ A reinforcement learning bot that plays Pokemon Showdown Gen 9 Random Battles us
 
 ## Project Status
 
-**Current Phase**: Phase 1 - Foundation
+**Current Phase**: Phase 2 - Core ML Pipeline (Complete)
 **Last Updated**: 2026-01-07
 
 ### Progress Tracker
@@ -22,10 +22,11 @@ A reinforcement learning bot that plays Pokemon Showdown Gen 9 Random Battles us
 
 #### Phase 2: Core ML Pipeline
 - [x] Implement neural network architecture
-- [ ] Implement PPO algorithm
-- [ ] Create experience buffer
-- [ ] Basic training loop (agent vs random opponent)
-- [ ] Logging and metrics (TensorBoard)
+- [x] Implement PPO algorithm (with clipped objective, GAE)
+- [x] Create experience/rollout buffer
+- [x] Basic training loop (agent vs random opponent)
+- [x] TensorBoard logging and metrics
+- [x] Checkpoint saving/loading
 
 #### Phase 3: Self-Play System
 - [ ] Implement self-play manager

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Main training script for the Pokemon Showdown RL bot."""
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -9,40 +10,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import torch
-from poke_env.player import RandomPlayer
-from tqdm import tqdm
 
-from showdown_bot.config import training_config, server_config
-from showdown_bot.environment.battle_env import NeuralNetworkPlayer, MaxDamagePlayer
-from showdown_bot.environment.state_encoder import StateEncoder
+from showdown_bot.config import training_config
 from showdown_bot.models.network import PolicyValueNetwork
+from showdown_bot.training.trainer import Trainer
 
 
-async def test_random_battles(
-    player1: RandomPlayer,
-    player2: RandomPlayer,
-    num_battles: int = 10,
-) -> tuple[int, int]:
-    """Run test battles between two players.
-
-    Returns:
-        Tuple of (player1_wins, player2_wins)
-    """
-    await player1.battle_against(player2, n_battles=num_battles)
-
-    p1_wins = player1.n_won_battles
-    p2_wins = player2.n_won_battles
-
-    return p1_wins, p2_wins
-
-
-async def train_agent() -> None:
-    """Main training loop."""
-    print("=" * 60)
-    print("Pokemon Showdown RL Bot - Training")
-    print("=" * 60)
-
-    # Check for GPU
+def get_device() -> torch.device:
+    """Get the best available device."""
     if torch.cuda.is_available():
         device = torch.device("cuda")
         print(f"Using GPU: {torch.cuda.get_device_name()}")
@@ -52,6 +27,12 @@ async def train_agent() -> None:
     else:
         device = torch.device("cpu")
         print("Using CPU")
+    return device
+
+
+async def train(args: argparse.Namespace) -> None:
+    """Main training function."""
+    device = get_device()
 
     # Create model
     print("\nInitializing neural network...")
@@ -59,62 +40,33 @@ async def train_agent() -> None:
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {num_params:,}")
 
-    # Create state encoder
-    state_encoder = StateEncoder(device=device)
-
-    # Create players
-    print("\nCreating players...")
-
-    # Our trained agent
-    agent = NeuralNetworkPlayer(
+    # Create trainer
+    trainer = Trainer(
         model=model,
-        state_encoder=state_encoder,
         device=device,
-        battle_format=training_config.battle_format,
-        max_concurrent_battles=1,
+        save_dir=args.save_dir,
+        log_dir=args.log_dir,
     )
 
-    # Opponent (start with random, later use self-play)
-    opponent = RandomPlayer(
-        battle_format=training_config.battle_format,
-        max_concurrent_battles=1,
-    )
+    # Load checkpoint if provided
+    if args.resume:
+        trainer.load_checkpoint(args.resume)
 
-    print(f"\nBattle format: {training_config.battle_format}")
-    print(f"Total training timesteps: {training_config.total_timesteps:,}")
+    # Start training
     print("\n" + "=" * 60)
     print("NOTE: Training requires a Pokemon Showdown server running locally.")
-    print("See: https://github.com/smogon/pokemon-showdown")
-    print("=" * 60)
-
-    # TODO: Implement full PPO training loop
-    # For now, just test that battles can run
-    print("\nRunning test battles to verify setup...")
+    print("If not running, start it with:")
+    print("  cd pokemon-showdown && node pokemon-showdown start --no-security")
+    print("=" * 60 + "\n")
 
     try:
-        # Test with two random players first
-        test_p1 = RandomPlayer(
-            battle_format=training_config.battle_format,
-            max_concurrent_battles=1,
+        await trainer.train(
+            total_timesteps=args.timesteps,
+            eval_interval=args.eval_interval,
+            save_interval=args.save_interval,
         )
-        test_p2 = RandomPlayer(
-            battle_format=training_config.battle_format,
-            max_concurrent_battles=1,
-        )
-
-        print("Testing random vs random (5 battles)...")
-        p1_wins, p2_wins = await test_random_battles(test_p1, test_p2, num_battles=5)
-        print(f"Results: Player 1 wins: {p1_wins}, Player 2 wins: {p2_wins}")
-
-        print("\nSetup verified! Full training loop coming soon.")
-        print("Next steps:")
-        print("  1. Implement PPO algorithm")
-        print("  2. Add experience buffer")
-        print("  3. Implement self-play")
-        print("  4. Add logging and checkpointing")
-
     except Exception as e:
-        print(f"\nError during testing: {e}")
+        print(f"\nError during training: {e}")
         print("\nMake sure Pokemon Showdown is running locally:")
         print("  1. Clone: git clone https://github.com/smogon/pokemon-showdown.git")
         print("  2. cd pokemon-showdown && npm install")
@@ -124,7 +76,51 @@ async def train_agent() -> None:
 
 def main() -> None:
     """Entry point."""
-    asyncio.run(train_agent())
+    parser = argparse.ArgumentParser(
+        description="Train the Pokemon Showdown RL bot",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--timesteps",
+        "-t",
+        type=int,
+        default=training_config.total_timesteps,
+        help="Total timesteps to train for",
+    )
+    parser.add_argument(
+        "--save-dir",
+        type=str,
+        default=training_config.save_dir,
+        help="Directory for saving checkpoints",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=training_config.log_dir,
+        help="Directory for TensorBoard logs",
+    )
+    parser.add_argument(
+        "--resume",
+        "-r",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from",
+    )
+    parser.add_argument(
+        "--eval-interval",
+        type=int,
+        default=training_config.eval_interval,
+        help="Steps between evaluations",
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=training_config.checkpoint_interval,
+        help="Steps between saving checkpoints",
+    )
+
+    args = parser.parse_args()
+    asyncio.run(train(args))
 
 
 if __name__ == "__main__":
