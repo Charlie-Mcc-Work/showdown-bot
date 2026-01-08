@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
-from showdown_bot.config import training_config
+from showdown_bot.config import training_config, TrainingConfig
 from showdown_bot.models.network import PolicyValueNetwork
 from showdown_bot.training.buffer import RolloutBuffer
 
@@ -191,16 +191,24 @@ class PPO:
         cls,
         model: PolicyValueNetwork,
         device: torch.device | None = None,
+        config: TrainingConfig | None = None,
     ) -> "PPO":
-        """Create PPO from global config."""
+        """Create PPO from config.
+
+        Args:
+            model: Policy and value network
+            device: Device to train on
+            config: Training config (uses global config if not provided)
+        """
+        cfg = config or training_config
         return cls(
             model=model,
-            learning_rate=training_config.learning_rate,
-            clip_epsilon=training_config.clip_epsilon,
-            value_coef=training_config.value_coef,
-            entropy_coef=training_config.entropy_coef,
-            max_grad_norm=training_config.max_grad_norm,
-            num_epochs=training_config.num_epochs,
+            learning_rate=cfg.learning_rate,
+            clip_epsilon=cfg.clip_epsilon,
+            value_coef=cfg.value_coef,
+            entropy_coef=cfg.entropy_coef,
+            max_grad_norm=cfg.max_grad_norm,
+            num_epochs=cfg.num_epochs,
             device=device,
         )
 

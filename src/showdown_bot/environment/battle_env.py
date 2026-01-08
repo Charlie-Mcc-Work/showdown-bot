@@ -6,7 +6,8 @@ from typing import Any
 import numpy as np
 import torch
 from poke_env.player import Player, RandomPlayer
-from poke_env.environment import AbstractBattle
+from poke_env.player.battle_order import BattleOrder
+from poke_env.battle import AbstractBattle
 
 from showdown_bot.config import server_config, training_config
 from showdown_bot.environment.state_encoder import EncodedState, StateEncoder
@@ -27,7 +28,7 @@ class RLPlayer(Player):
         self._waiting_for_action = asyncio.Event()
         self._action_ready = asyncio.Event()
 
-    def choose_move(self, battle: AbstractBattle) -> str:
+    def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Called by poke-env when it's time to choose a move.
 
         This method bridges the async poke-env interface with our RL training loop.
@@ -70,7 +71,7 @@ class RLPlayer(Player):
 class MaxDamagePlayer(Player):
     """A simple heuristic player that always picks the highest damage move."""
 
-    def choose_move(self, battle: AbstractBattle) -> str:
+    def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Choose the move that deals maximum expected damage."""
         if not battle.available_moves:
             return self.choose_random_move(battle)
@@ -125,7 +126,7 @@ class NeuralNetworkPlayer(Player):
         self.device = device or torch.device("cpu")
         self.deterministic = deterministic
 
-    def choose_move(self, battle: AbstractBattle) -> str:
+    def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Choose a move using the neural network."""
         # Encode state
         state = self.state_encoder.encode_battle(battle)

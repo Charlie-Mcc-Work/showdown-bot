@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from poke_env.environment import (
+from poke_env.battle import (
     AbstractBattle,
     Effect,
     Field,
@@ -15,6 +15,7 @@ from poke_env.environment import (
     Status,
     Weather,
 )
+from poke_env.player.battle_order import BattleOrder, SingleBattleOrder
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -390,7 +391,7 @@ class StateEncoder:
         self,
         action: int,
         battle: AbstractBattle,
-    ) -> str | None:
+    ) -> BattleOrder | None:
         """Convert action index to poke-env battle order.
 
         Returns None if action is invalid.
@@ -400,7 +401,7 @@ class StateEncoder:
             available_moves = battle.available_moves
             if action < len(available_moves):
                 move = available_moves[action]
-                return battle.create_order(move)
+                return SingleBattleOrder(move)
         else:
             # Switch action
             switch_idx = action - 4
@@ -411,7 +412,7 @@ class StateEncoder:
                 if pokemon in team_list:
                     idx = team_list.index(pokemon)
                     if idx == switch_idx:
-                        return battle.create_order(pokemon)
+                        return SingleBattleOrder(pokemon)
 
         return None
 

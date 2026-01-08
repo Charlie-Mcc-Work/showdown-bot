@@ -7,7 +7,8 @@ from typing import Any
 
 import torch
 from poke_env.player import Player
-from poke_env.environment import AbstractBattle
+from poke_env.player.battle_order import BattleOrder
+from poke_env.battle import AbstractBattle
 
 from showdown_bot.config import training_config
 from showdown_bot.environment.state_encoder import StateEncoder
@@ -63,7 +64,7 @@ class HistoricalPlayer(Player):
             # Assume it's just the state dict
             self.model.load_state_dict(checkpoint)
 
-    def choose_move(self, battle: AbstractBattle) -> str:
+    def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Choose a move using the loaded model."""
         state = self.state_encoder.encode_battle(battle)
 

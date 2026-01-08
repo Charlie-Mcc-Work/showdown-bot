@@ -4,7 +4,13 @@
 import argparse
 import asyncio
 import sys
+import warnings
 from pathlib import Path
+
+# Suppress ROCm/PyTorch experimental feature warnings
+warnings.filterwarnings("ignore", message=".*hipBLASLt.*")
+warnings.filterwarnings("ignore", message=".*Flash attention.*experimental.*")
+warnings.filterwarnings("ignore", message=".*Memory Efficient attention.*experimental.*")
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -30,6 +36,31 @@ def get_device() -> torch.device:
     return device
 
 
+def find_latest_checkpoint(save_dir: str) -> Path | None:
+    """Find the latest checkpoint in save_dir."""
+    save_path = Path(save_dir)
+    if not save_path.exists():
+        return None
+
+    # Check for latest.pt first
+    latest = save_path / "latest.pt"
+    if latest.exists():
+        return latest
+
+    # Find checkpoint with highest timestep
+    checkpoints = list(save_path.glob("checkpoint_*.pt"))
+    if not checkpoints:
+        return None
+
+    def get_timestep(p: Path) -> int:
+        try:
+            return int(p.stem.split("_")[1])
+        except (IndexError, ValueError):
+            return 0
+
+    return max(checkpoints, key=get_timestep)
+
+
 async def train(args: argparse.Namespace) -> None:
     """Main training function."""
     device = get_device()
@@ -46,17 +77,30 @@ async def train(args: argparse.Namespace) -> None:
         device=device,
         save_dir=args.save_dir,
         log_dir=args.log_dir,
+        self_play_dir=args.self_play_dir,
+        use_self_play=not args.no_self_play,
+        num_envs=args.num_envs,
     )
 
     # Load checkpoint if provided
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        if args.resume == "auto":
+            # Find latest checkpoint
+            checkpoint_path = find_latest_checkpoint(args.save_dir)
+            if checkpoint_path:
+                print(f"\nAuto-resuming from: {checkpoint_path}")
+                trainer.load_checkpoint(str(checkpoint_path))
+            else:
+                print("\nNo checkpoint found, starting fresh training")
+        else:
+            # Use specified path
+            trainer.load_checkpoint(args.resume)
 
     # Start training
     print("\n" + "=" * 60)
     print("NOTE: Training requires a Pokemon Showdown server running locally.")
     print("If not running, start it with:")
-    print("  cd pokemon-showdown && node pokemon-showdown start --no-security")
+    print("  cd ~/pokemon-showdown && node pokemon-showdown start --no-security")
     print("=" * 60 + "\n")
 
     try:
@@ -100,11 +144,19 @@ def main() -> None:
         help="Directory for TensorBoard logs",
     )
     parser.add_argument(
+        "--self-play-dir",
+        type=str,
+        default="data/opponents",
+        help="Directory for self-play opponent pool",
+    )
+    parser.add_argument(
         "--resume",
         "-r",
         type=str,
+        nargs="?",
+        const="auto",
         default=None,
-        help="Path to checkpoint to resume from",
+        help="Resume from checkpoint. Use without argument to auto-find latest, or specify path",
     )
     parser.add_argument(
         "--eval-interval",
@@ -117,6 +169,18 @@ def main() -> None:
         type=int,
         default=training_config.checkpoint_interval,
         help="Steps between saving checkpoints",
+    )
+    parser.add_argument(
+        "--no-self-play",
+        action="store_true",
+        help="Disable self-play training (train against random only)",
+    )
+    parser.add_argument(
+        "--num-envs",
+        "-e",
+        type=int,
+        default=training_config.num_envs,
+        help="Number of parallel environments for faster training",
     )
 
     args = parser.parse_args()
