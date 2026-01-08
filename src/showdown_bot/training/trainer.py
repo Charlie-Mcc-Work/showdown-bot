@@ -675,6 +675,9 @@ class Trainer:
                     self._best_win_rate = rollout_stats["win_rate"]  # For tuning
                     self._save_checkpoint("best_model.pt")
 
+                # Clean up opponent connections to prevent file descriptor leak
+                await self._cleanup_players(opponents)
+
         except Exception as e:
             print(f"\nError during training: {e}")
             print("Saving emergency checkpoint...")

@@ -1,9 +1,9 @@
 // Pokemon Showdown Coach - Content Script
-// Reads battle state and displays AI move recommendations
+// Handles UI and API communication (runs in isolated world)
 
 const API_URL = 'http://localhost:5000/recommend';
-let lastBattleState = null;
 let coachPanel = null;
+let lastStateJson = null;
 
 // Create the coach panel UI
 function createCoachPanel() {
@@ -29,129 +29,6 @@ function createCoachPanel() {
     });
 
     return coachPanel;
-}
-
-// Extract battle state from Pokemon Showdown's JavaScript
-function extractBattleState() {
-    // Pokemon Showdown stores battle data in app.curRoom.battle
-    if (typeof app === 'undefined' || !app.curRoom || !app.curRoom.battle) {
-        return null;
-    }
-
-    const battle = app.curRoom.battle;
-
-    // Check if it's our turn
-    if (!battle.myPokemon || battle.ended) {
-        return null;
-    }
-
-    try {
-        const state = {
-            // Our team
-            myTeam: battle.myPokemon.map(p => ({
-                species: p.speciesForme || p.species,
-                hp: p.hp,
-                maxHp: p.maxhp,
-                status: p.status || null,
-                active: p.active || false,
-                fainted: p.fainted || false,
-                moves: p.moves || [],
-                ability: p.ability || p.baseAbility,
-                item: p.item
-            })),
-
-            // Our active Pokemon
-            myActive: null,
-
-            // Opponent's visible Pokemon
-            opponentTeam: [],
-            opponentActive: null,
-
-            // Field conditions
-            weather: battle.weather || null,
-            terrain: battle.terrain || null,
-
-            // Available actions
-            availableMoves: [],
-            availableSwitches: [],
-
-            // Turn info
-            turn: battle.turn,
-
-            // Is it our turn to move?
-            waitingForChoice: battle.request && !battle.request.wait
-        };
-
-        // Get active Pokemon details
-        if (battle.mySide && battle.mySide.active && battle.mySide.active[0]) {
-            const active = battle.mySide.active[0];
-            state.myActive = {
-                species: active.speciesForme || active.species,
-                hp: active.hp,
-                maxHp: active.maxhp,
-                status: active.status,
-                boosts: active.boosts || {},
-                volatiles: Object.keys(active.volatiles || {})
-            };
-        }
-
-        // Get opponent's active Pokemon
-        if (battle.farSide && battle.farSide.active && battle.farSide.active[0]) {
-            const opp = battle.farSide.active[0];
-            state.opponentActive = {
-                species: opp.speciesForme || opp.species,
-                hp: opp.hp,
-                maxHp: opp.maxhp,
-                status: opp.status,
-                boosts: opp.boosts || {},
-                volatiles: Object.keys(opp.volatiles || {})
-            };
-        }
-
-        // Get opponent's revealed Pokemon
-        if (battle.farSide && battle.farSide.pokemon) {
-            state.opponentTeam = battle.farSide.pokemon.map(p => ({
-                species: p.speciesForme || p.species,
-                hp: p.hp,
-                maxHp: p.maxhp,
-                status: p.status,
-                fainted: p.fainted,
-                revealed: true
-            }));
-        }
-
-        // Get available moves from the request
-        if (battle.request && battle.request.active && battle.request.active[0]) {
-            const activeReq = battle.request.active[0];
-            if (activeReq.moves) {
-                state.availableMoves = activeReq.moves.map((m, i) => ({
-                    id: m.id,
-                    name: m.move,
-                    pp: m.pp,
-                    maxPp: m.maxpp,
-                    disabled: m.disabled || false,
-                    index: i
-                }));
-            }
-        }
-
-        // Get available switches
-        if (battle.request && battle.request.side && battle.request.side.pokemon) {
-            state.availableSwitches = battle.request.side.pokemon
-                .filter((p, i) => i > 0 && !p.fainted && p.hp > 0)
-                .map((p, i) => ({
-                    species: p.speciesForme || p.species,
-                    hp: p.hp,
-                    maxHp: p.maxhp,
-                    index: i + 1
-                }));
-        }
-
-        return state;
-    } catch (e) {
-        console.error('[PS Coach] Error extracting battle state:', e);
-        return null;
-    }
 }
 
 // Send state to API and get recommendations
@@ -182,7 +59,7 @@ function updatePanel(recommendations) {
     const status = coachPanel.querySelector('.coach-status');
 
     if (recommendations.error) {
-        status.textContent = 'Coach offline - start the server';
+        status.textContent = 'Coach offline - start server';
         status.className = 'coach-status error';
         content.innerHTML = `
             <div class="coach-help">
@@ -210,37 +87,44 @@ function updatePanel(recommendations) {
     `).join('');
 }
 
-// Main loop - check for battle state changes
-function pollBattleState() {
-    const state = extractBattleState();
+// Handle messages from the page script (runs in MAIN world)
+window.addEventListener('message', async (event) => {
+    if (event.source !== window) return;
+    if (!event.data || event.data.type !== 'PS_COACH_BATTLE_STATE') return;
 
-    if (state && state.waitingForChoice) {
-        // We're in a battle and it's our turn
-        const stateStr = JSON.stringify(state);
+    const state = event.data.state;
+    const status = coachPanel?.querySelector('.coach-status');
 
-        if (stateStr !== lastBattleState) {
-            lastBattleState = stateStr;
-
-            // Show panel if hidden
-            if (!coachPanel) createCoachPanel();
-            coachPanel.style.display = 'block';
-
-            // Get recommendations
-            getRecommendations(state).then(updatePanel);
+    if (!state) {
+        // Not in battle or not our turn
+        if (status) {
+            if (event.data.reason === 'no_battle') {
+                status.textContent = 'Waiting for battle...';
+            } else if (event.data.reason === 'not_our_turn') {
+                status.textContent = "Opponent's turn...";
+            } else {
+                status.textContent = 'Waiting...';
+            }
+            status.className = 'coach-status';
         }
-    } else if (!state) {
-        // Not in a battle
-        lastBattleState = null;
+        // Clear recommendations when not our turn
         if (coachPanel) {
-            coachPanel.querySelector('.coach-status').textContent = 'Waiting for battle...';
             coachPanel.querySelector('.coach-recommendations').innerHTML = '';
         }
+        lastStateJson = null;
+        return;
     }
-}
+
+    // Only update if state changed
+    const stateJson = JSON.stringify(state);
+    if (stateJson === lastStateJson) return;
+    lastStateJson = stateJson;
+
+    // Get recommendations from API
+    const recommendations = await getRecommendations(state);
+    updatePanel(recommendations);
+});
 
 // Initialize
-console.log('[PS Coach] Pokemon Showdown Coach loaded');
+console.log('[PS Coach] Content script loaded');
 createCoachPanel();
-
-// Poll every 500ms
-setInterval(pollBattleState, 500);

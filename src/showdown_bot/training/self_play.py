@@ -57,8 +57,8 @@ class HistoricalPlayer(Player):
 
     def _load_checkpoint(self, path: Path) -> None:
         """Load model weights from checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
-        if "model_state_dict" in checkpoint:
+        checkpoint = torch.load(path, map_location=self.device, weights_only=True)
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             self.model.load_state_dict(checkpoint["model_state_dict"])
         else:
             # Assume it's just the state dict

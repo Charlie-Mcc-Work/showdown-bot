@@ -15,8 +15,9 @@ Current task queue:
 
 ### Browser Coaching Extension (Complete)
 Chrome extension that coaches you on play.pokemonshowdown.com:
-- `extension/manifest.json` - Extension manifest (v3)
-- `extension/content.js` - Reads battle state from PS, sends to local server
+- `extension/manifest.json` - Extension manifest (v3 with `world: "MAIN"`)
+- `extension/page-script.js` - Runs in page context, extracts battle state from `app.curRoom`
+- `extension/content.js` - Handles UI and API communication (isolated world)
 - `extension/styles.css` - Coach panel styling
 - `extension/icon48.png` & `icon128.png` - Extension icons
 - `scripts/coach_server.py` - Flask server with model inference
@@ -29,18 +30,27 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 - Status move prioritization, setup move detection, priority move awareness
 - Health/recommend API endpoints
 
+**Technical notes:**
+- Uses `world: "MAIN"` in manifest to access page JavaScript variables
+- Battle request is at `app.curRoom.request`, not `app.curRoom.battle.request`
+- Two-script architecture: page-script.js (MAIN world) + content.js (isolated world)
+
 **To use:**
 1. Start server: `uv run python scripts/coach_server.py`
 2. Load extension in Chrome: chrome://extensions > Developer mode > Load unpacked > select extension/
 3. Go to https://play.pokemonshowdown.com and start a battle
 4. Coach panel shows AI-powered move recommendations
 
-### Known Issues (2026-01-07) - RESOLVED
+### Known Issues - RESOLVED
 1. **Training websocket error**: FIXED - Added automatic retry with connection recovery.
    The trainer now catches websocket errors, recreates players, and resumes training.
    See `collect_rollout_with_retry()` in `trainer.py`.
 
-2. **Browser auth**: WORKAROUND - Use console login command.
+2. **File descriptor leak (2026-01-08)**: FIXED - Opponents are now cleaned up after each
+   training loop iteration. Previously, HistoricalPlayer websocket connections accumulated
+   until hitting the system limit (~1024 open files). See line 678 in `trainer.py`.
+
+3. **Browser auth**: WORKAROUND - Use console login command.
    The testclient's auth can be bypassed using the browser console:
    ```javascript
    app.socket.send('|/trn YourName,0,')
@@ -53,6 +63,9 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 **Last Updated**: 2026-01-08
 
 ### Recent Changes
+- **File descriptor leak fix (2026-01-08)**: Fixed opponents not being cleaned up after training loops
+- **Extension page context fix**: Uses `world: "MAIN"` and `app.curRoom.request` for proper PS integration
+- **torch.load warnings**: Added explicit `weights_only` parameter to suppress FutureWarnings
 - **Browser coaching extension complete**: Full model integration with BrowserStateEncoder
 - **Extension icons**: Auto-generated Pokeball-style icons (scripts/create_icons.py)
 - **Comprehensive tests**: 23 new tests for coaching server (tests/test_coach.py)
