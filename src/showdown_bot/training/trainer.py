@@ -287,10 +287,22 @@ class Trainer:
         def signal_handler(signum, frame):
             if self._shutdown_requested:
                 print("\nForce quitting...")
+                # Cancel all running tasks
+                for task in asyncio.all_tasks():
+                    if not task.done():
+                        task.cancel()
                 sys.exit(1)
-            print("\n\nShutdown requested. Finishing current rollout and saving checkpoint...")
+            print("\n\nShutdown requested. Saving checkpoint...")
             print("Press Ctrl+C again to force quit.")
             self._shutdown_requested = True
+            # Cancel running tasks to speed up shutdown
+            try:
+                loop = asyncio.get_running_loop()
+                for task in asyncio.all_tasks(loop):
+                    if task is not asyncio.current_task() and not task.done():
+                        task.cancel()
+            except RuntimeError:
+                pass  # No running loop
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -314,8 +326,22 @@ class Trainer:
         all_experiences: list[dict[str, Any]] = []
 
         while len(all_experiences) < num_steps:
-            # Play a battle
-            await player.battle_against(opponent, n_battles=1)
+            # Check for shutdown request before starting a new battle
+            if self._shutdown_requested:
+                break
+
+            # Play a battle with timeout to prevent hanging
+            try:
+                await asyncio.wait_for(
+                    player.battle_against(opponent, n_battles=1),
+                    timeout=120.0  # 2 minute timeout per battle
+                )
+            except asyncio.TimeoutError:
+                tqdm.write(f"\n  Battle timeout - skipping")
+                break
+            except asyncio.CancelledError:
+                # Task was cancelled (e.g., during shutdown)
+                break
 
             # Get experiences from the battle
             experiences = player.get_experiences()
@@ -341,10 +367,36 @@ class Trainer:
         """
         # Run all environments in parallel
         tasks = [
-            self.collect_rollout_single(player, opponent, num_steps)
+            asyncio.create_task(self.collect_rollout_single(player, opponent, num_steps))
             for player, opponent in zip(players, opponents)
         ]
-        return await asyncio.gather(*tasks)
+
+        try:
+            return await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Cancel all pending tasks on shutdown
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            # Wait for cancellation to complete (with short timeout)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                pass  # Some tasks didn't cancel in time, continue anyway
+            # Return whatever experiences were collected
+            results = []
+            for task in tasks:
+                try:
+                    if task.done() and not task.cancelled():
+                        results.append(task.result())
+                    else:
+                        results.append([])
+                except Exception:
+                    results.append([])
+            return results
 
     async def collect_rollout_with_retry(
         self,
@@ -685,6 +737,9 @@ class Trainer:
                 # Clean up opponent connections to prevent file descriptor leak
                 await self._cleanup_players(opponents)
 
+        except asyncio.CancelledError:
+            # Task was cancelled during shutdown - this is expected
+            print("\nTraining cancelled.")
         except Exception as e:
             print(f"\nError during training: {e}")
             print("Saving emergency checkpoint...")
