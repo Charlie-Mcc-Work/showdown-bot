@@ -260,18 +260,18 @@ class TestOpponentPool:
         assert opponent is not None
         assert opponent.timestep_added in [1000, 2000]
 
-    def test_sample_elo_matched(self, pool, model):
-        """Test Elo-matched sampling prefers similar ratings."""
-        info1 = pool.add_opponent(model, timestep=1000, elo_rating=800)
-        info2 = pool.add_opponent(model, timestep=2000, elo_rating=1200)
+    def test_sample_skill_matched(self, pool, model):
+        """Test skill-matched sampling prefers similar ratings."""
+        info1 = pool.add_opponent(model, timestep=1000, skill_rating=800)
+        info2 = pool.add_opponent(model, timestep=2000, skill_rating=1200)
 
         # Sample many times and count
         counts = {1000: 0, 2000: 0}
         for _ in range(100):
-            opp = pool.sample_opponent(strategy="elo_matched", current_elo=850)
+            opp = pool.sample_opponent(strategy="skill_matched", current_skill=850)
             counts[opp.timestep_added] += 1
 
-        # Should prefer the 800 Elo opponent when current is 850
+        # Should prefer the 800 skill opponent when current is 850
         assert counts[1000] > counts[2000]
 
     def test_sample_prioritized(self, pool, model):
@@ -293,29 +293,29 @@ class TestOpponentPool:
     def test_pool_pruning(self, pool, model):
         """Test pool prunes when over max size."""
         for i in range(10):
-            pool.add_opponent(model, timestep=i * 1000, elo_rating=1000 + i * 50)
+            pool.add_opponent(model, timestep=i * 1000, skill_rating=1000 + i * 50)
 
         assert pool.size <= pool.max_size
 
     def test_update_stats(self, pool, model):
         """Test updating opponent stats after a game."""
-        info = pool.add_opponent(model, timestep=1000, elo_rating=1000)
+        info = pool.add_opponent(model, timestep=1000, skill_rating=1000)
 
-        new_agent_elo, new_opp_elo = pool.update_stats(
-            info, won=True, agent_elo=1000
+        new_agent_skill, new_opp_skill = pool.update_stats(
+            info, won=True, agent_skill=1000
         )
 
         assert info.games_played == 1
         assert info.losses == 1  # Opponent lost
-        assert new_agent_elo > 1000
-        assert new_opp_elo < 1000
+        assert new_agent_skill > 1000
+        assert new_opp_skill < 1000
 
-    def test_average_elo(self, pool, model):
-        """Test average Elo calculation."""
-        pool.add_opponent(model, timestep=1000, elo_rating=800)
-        pool.add_opponent(model, timestep=2000, elo_rating=1200)
+    def test_average_skill(self, pool, model):
+        """Test average skill calculation."""
+        pool.add_opponent(model, timestep=1000, skill_rating=800)
+        pool.add_opponent(model, timestep=2000, skill_rating=1200)
 
-        assert pool.average_elo == 1000.0
+        assert pool.average_skill == 1000.0
 
 
 class TestSelfPlayManager:
@@ -356,13 +356,13 @@ class TestSelfPlayManager:
         """Test adding checkpoint to pool."""
         info = manager.add_checkpoint(model, timestep=1000)
 
-        assert info.elo_rating == manager.agent_elo
+        assert info.skill_rating == manager.agent_skill
         assert manager.opponent_pool.size == 1
         assert manager.last_checkpoint_timestep == 1000
 
     def test_get_opponent_random_when_empty(self, manager):
         """Test get_opponent returns random when pool empty."""
-        with patch("showdown_bot.training.self_play.RandomPlayer") as mock_random:
+        with patch("poke_env.player.RandomPlayer") as mock_random:
             mock_player = MagicMock()
             mock_random.return_value = mock_player
 
@@ -374,19 +374,19 @@ class TestSelfPlayManager:
     def test_update_after_game_self_play(self, manager, model):
         """Test updating stats after self-play game."""
         info = manager.add_checkpoint(model, timestep=1000)
-        initial_elo = manager.agent_elo
+        initial_skill = manager.agent_skill
 
         manager.update_after_game(info, won=True)
 
-        assert manager.agent_elo > initial_elo
+        assert manager.agent_skill > initial_skill
 
     def test_update_after_game_random(self, manager):
         """Test updating stats after random opponent game."""
-        initial_elo = manager.agent_elo
+        initial_skill = manager.agent_skill
 
         manager.update_after_game(None, won=True)  # None = random opponent
 
-        assert manager.agent_elo == initial_elo  # No change for random
+        assert manager.agent_skill == initial_skill  # No change for random
 
     def test_get_stats(self, manager, model):
         """Test getting manager statistics."""
@@ -394,7 +394,7 @@ class TestSelfPlayManager:
 
         stats = manager.get_stats()
 
-        assert "agent_elo" in stats
+        assert "agent_skill" in stats
         assert "pool_size" in stats
         assert stats["pool_size"] == 1
 

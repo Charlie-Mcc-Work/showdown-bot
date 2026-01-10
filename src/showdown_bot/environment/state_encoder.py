@@ -367,10 +367,12 @@ class StateEncoder:
         """
         mask = np.zeros(self.NUM_ACTIONS, dtype=np.float32)
 
-        # Check available moves
-        available_moves = battle.available_moves
-        for i, move in enumerate(available_moves[:4]):
-            mask[i] = 1.0
+        # During a forced switch (Pokemon fainted), only switches are valid
+        if not battle.force_switch:
+            # Check available moves
+            available_moves = battle.available_moves
+            for i, move in enumerate(available_moves[:4]):
+                mask[i] = 1.0
 
         # Check available switches
         available_switches = battle.available_switches
@@ -381,7 +383,9 @@ class StateEncoder:
                 if idx < 5:  # Max 5 switch targets
                     mask[4 + idx] = 1.0
 
-        # If no legal actions (shouldn't happen), enable first move
+        # If no legal actions, enable first move as last resort
+        # This lets action_to_battle_order return None, triggering choose_random_move
+        # which has proper handling for all edge cases including forced switches
         if mask.sum() == 0:
             mask[0] = 1.0
 
@@ -396,6 +400,13 @@ class StateEncoder:
 
         Returns None if action is invalid.
         """
+        # During forced switch, only switch actions are valid
+        if battle.force_switch:
+            if action < 4:
+                # Model tried to use a move during forced switch - invalid
+                return None
+            # Fall through to switch handling below
+
         if action < 4:
             # Move action
             available_moves = battle.available_moves

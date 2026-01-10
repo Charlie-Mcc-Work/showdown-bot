@@ -331,6 +331,9 @@ class TestActionMask:
     def mock_battle(self):
         battle = MagicMock()
 
+        # Mock force_switch (required for mask logic)
+        battle.force_switch = False
+
         # Mock available moves
         move1 = MagicMock()
         move2 = MagicMock()
@@ -384,6 +387,9 @@ class TestActionToBattleOrder:
     def mock_battle(self):
         battle = MagicMock()
 
+        # Mock force_switch (required for action_to_battle_order logic)
+        battle.force_switch = False
+
         move1 = MagicMock()
         move2 = MagicMock()
         battle.available_moves = [move1, move2]
@@ -396,23 +402,24 @@ class TestActionToBattleOrder:
         battle.team = {"active": active, "poke1": poke1, "poke2": poke2}
         battle.available_switches = [poke1]
 
-        battle.create_order = MagicMock(return_value="order")
-
         return battle
 
     def test_action_to_move(self, encoder, mock_battle):
         """Test converting move action to order."""
         result = encoder.action_to_battle_order(0, mock_battle)
 
-        mock_battle.create_order.assert_called_once()
-        assert result == "order"
+        # Should return a SingleBattleOrder for the first move
+        assert result is not None
+        assert result.order == mock_battle.available_moves[0]
 
     def test_action_to_switch(self, encoder, mock_battle):
         """Test converting switch action to order."""
         result = encoder.action_to_battle_order(4, mock_battle)
 
-        mock_battle.create_order.assert_called_once()
-        assert result == "order"
+        # Should return a SingleBattleOrder for the switch target
+        assert result is not None
+        # The switch target should be poke1 (first in available_switches)
+        assert result.order == mock_battle.available_switches[0]
 
     def test_invalid_move_action(self, encoder, mock_battle):
         """Test invalid move index returns None."""

@@ -224,7 +224,8 @@ class TestRolloutBufferBatches:
                 opponent_active_idx=np.zeros(2, dtype=np.int64),
                 field_state=np.random.randn(2, StateEncoder.FIELD_FEATURES).astype(np.float32),
                 action_mask=np.ones((2, StateEncoder.NUM_ACTIONS), dtype=np.float32),
-                action=np.zeros(2, dtype=np.int64),
+                # Use varied actions to make shuffle test meaningful
+                action=np.array([i % 9, (i + 1) % 9], dtype=np.int64),
                 log_prob=np.full(2, -1.0, dtype=np.float32),
                 reward=np.random.randn(2).astype(np.float32),
                 done=np.zeros(2, dtype=np.float32),
@@ -612,11 +613,31 @@ class TestPPOLosses:
 
         assert np.isfinite(stats.policy_loss)
 
-    def test_entropy_coefficient_effect(self, model):
+    def test_entropy_coefficient_effect(self):
         """Test entropy coefficient affects total loss."""
-        ppo_low_entropy = PPO(model, entropy_coef=0.001, num_epochs=1)
-        ppo_high_entropy = PPO(model, entropy_coef=0.1, num_epochs=1)
+        # Create separate models to ensure independent updates
+        model_low = PolicyValueNetwork(
+            hidden_dim=64,
+            pokemon_dim=32,
+            num_heads=2,
+            num_layers=1,
+            num_actions=9,
+        )
+        model_high = PolicyValueNetwork(
+            hidden_dim=64,
+            pokemon_dim=32,
+            num_heads=2,
+            num_layers=1,
+            num_actions=9,
+        )
+        # Copy weights to start with identical models
+        model_high.load_state_dict(model_low.state_dict())
 
+        ppo_low_entropy = PPO(model_low, entropy_coef=0.001, num_epochs=1)
+        ppo_high_entropy = PPO(model_high, entropy_coef=0.1, num_epochs=1)
+
+        # Use fixed seed for reproducible buffer
+        np.random.seed(42)
         buffer = RolloutBuffer(buffer_size=4, num_envs=1)
         for i in range(4):
             buffer.add(
@@ -636,10 +657,33 @@ class TestPPOLosses:
         buffer.compute_advantages(np.zeros(1), np.zeros(1))
 
         stats_low = ppo_low_entropy.update(buffer, batch_size=4)
-        stats_high = ppo_high_entropy.update(buffer, batch_size=4)
 
-        # Higher entropy coef should have larger (more negative) entropy contribution
-        assert stats_high.entropy_loss != stats_low.entropy_loss
+        # Reset buffer for second model
+        np.random.seed(42)
+        buffer2 = RolloutBuffer(buffer_size=4, num_envs=1)
+        for i in range(4):
+            buffer2.add(
+                player_pokemon=np.random.randn(1, 6, StateEncoder.POKEMON_FEATURES).astype(np.float32),
+                opponent_pokemon=np.random.randn(1, 6, StateEncoder.POKEMON_FEATURES).astype(np.float32),
+                player_active_idx=0,
+                opponent_active_idx=0,
+                field_state=np.random.randn(1, StateEncoder.FIELD_FEATURES).astype(np.float32),
+                action_mask=np.ones((1, StateEncoder.NUM_ACTIONS), dtype=np.float32),
+                action=0,
+                log_prob=-1.0,
+                reward=0.0,
+                done=False,
+                value=0.0,
+            )
+
+        buffer2.compute_advantages(np.zeros(1), np.zeros(1))
+        stats_high = ppo_high_entropy.update(buffer2, batch_size=4)
+
+        # Higher entropy coef should affect total_loss differently
+        # entropy_loss is raw entropy (same for identical models)
+        # but total_loss = policy_loss + value_coef*value_loss - entropy_coef*entropy_loss
+        # So higher entropy_coef means more negative total_loss (since entropy_loss is negative)
+        assert abs(stats_high.total_loss - stats_low.total_loss) > 0.01
 
 
 class TestPPOStatsDataclass:

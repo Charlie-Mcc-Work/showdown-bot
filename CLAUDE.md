@@ -63,6 +63,12 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 **Last Updated**: 2026-01-08
 
 ### Recent Changes
+- **OU Module (2026-01-08)**: Added Gen 9 OU expansion module with teambuilding and player components
+  - See `src/showdown_bot/ou/README.md` for full architecture
+  - Shared embeddings for Pokemon, moves, items, abilities
+  - Autoregressive team generator with evaluator
+  - OU-specific state encoder with opponent prediction
+  - Team preview lead selection
 - **File descriptor leak fix (2026-01-08)**: Fixed opponents not being cleaned up after training loops
 - **Extension page context fix**: Uses `world: "MAIN"` and `app.curRoom.request` for proper PS integration
 - **torch.load warnings**: Added explicit `weights_only` parameter to suppress FutureWarnings
@@ -107,7 +113,7 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 #### Phase 3: Self-Play System - COMPLETE
 - [x] Implement self-play manager
 - [x] Opponent pool with historical checkpoints
-- [x] Elo rating tracking
+- [x] Skill rating tracking (Elo algorithm)
 - [x] Comprehensive test suite
 - [x] Self-play integrated into trainer
 - [x] Parallel environment support (moved to Phase 4, now complete)
@@ -132,10 +138,19 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 - [x] Model inference server (Flask API)
 - [ ] Screen capture integration (future)
 
-#### Phase 7: OU Expansion (Future)
-- [ ] Team building module
+#### Phase 7: OU Expansion - IN PROGRESS
+- [x] Module architecture design (see `src/showdown_bot/ou/README.md`)
+- [x] Shared embeddings (Pokemon, moves, items, abilities)
+- [x] Team representation and serialization
+- [x] Autoregressive team generator (placeholder)
+- [x] Team evaluator network (placeholder)
+- [x] OU state encoder with opponent prediction
+- [x] Team preview lead selector
+- [ ] Training loop for teambuilder
+- [ ] Training loop for player
+- [ ] Usage stats integration
 - [ ] Metagame analysis
-- [ ] Standard battle adaptation
+- [ ] Full training pipeline
 
 ---
 
@@ -174,8 +189,22 @@ showdown-bot/
 │   ├── environment/             # Battle environment wrappers
 │   ├── models/                  # Neural network architecture
 │   ├── training/                # PPO, self-play, buffers
-│   ├── evaluation/              # Elo tracking, metrics
-│   └── browser/                 # Future browser integration
+│   ├── evaluation/              # Skill rating tracking, metrics
+│   ├── browser/                 # Future browser integration
+│   └── ou/                      # Gen 9 OU expansion module
+│       ├── README.md            # OU module documentation
+│       ├── shared/              # Shared embeddings and encoders
+│       │   ├── embeddings.py    # Pokemon/move/item embeddings
+│       │   ├── encoders.py      # Team and Pokemon encoders
+│       │   └── data_loader.py   # Data loading utilities
+│       ├── teambuilder/         # Autoregressive team generator
+│       │   ├── team_repr.py     # Team representation
+│       │   ├── generator.py     # Team generation network
+│       │   └── evaluator.py     # Team quality predictor
+│       └── player/              # OU battle player
+│           ├── state_encoder.py # OU-specific state encoding
+│           ├── network.py       # Policy-value network
+│           └── team_preview.py  # Lead selection
 │
 ├── scripts/
 │   ├── train.py                 # Main training script
@@ -240,7 +269,7 @@ cd ~/pokemon-showdown && node pokemon-showdown start --no-security
 - `src/showdown_bot/models/network.py` - Neural network
 - `src/showdown_bot/training/ppo.py` - PPO implementation
 - `src/showdown_bot/training/self_play.py` - Self-play manager and opponent pool
-- `src/showdown_bot/evaluation/elo.py` - Elo rating system
+- `src/showdown_bot/evaluation/elo.py` - Skill rating system (uses Elo algorithm internally, displayed as "skill" not "elo" to avoid confusion with Showdown's ladder)
 - `src/showdown_bot/environment/state_encoder.py` - State encoding
 
 ### Browser Play (Working)

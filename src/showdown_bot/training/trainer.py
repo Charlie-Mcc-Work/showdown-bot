@@ -229,7 +229,7 @@ class Trainer:
             max_pool_size=20,
             self_play_ratio=self.config.self_play_ratio,
             checkpoint_interval=self.config.checkpoint_interval,
-            sampling_strategy="elo_matched",
+            sampling_strategy="skill_matched",
             device=device,
         ) if use_self_play else None
 
@@ -267,13 +267,20 @@ class Trainer:
 
     async def _cleanup_players(self, players: list[Player]) -> None:
         """Clean up player websocket connections gracefully."""
+        cleanup_tasks = []
         for player in players:
             try:
-                # poke-env players may have a stop_listening method
-                if hasattr(player, 'stop_listening'):
-                    await player.stop_listening()
+                # poke-env players have ps_client which manages the websocket
+                if hasattr(player, 'ps_client') and player.ps_client is not None:
+                    cleanup_tasks.append(player.ps_client.stop_listening())
             except Exception:
                 pass  # Ignore cleanup errors
+
+        # Wait for all cleanups to complete
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            # Small delay to allow connections to fully close
+            await asyncio.sleep(0.1)
 
     def _setup_signal_handlers(self) -> None:
         """Setup handlers for graceful shutdown."""
@@ -560,7 +567,7 @@ class Trainer:
         print(f"Learning rate: {self.config.learning_rate}")
         print(f"Self-play: {'Enabled' if self.use_self_play else 'Disabled'}")
         if self.self_play_manager:
-            print(f"Agent Elo: {self.self_play_manager.agent_elo:.0f}")
+            print(f"Agent Skill: {self.self_play_manager.agent_skill:.0f}")
             print(f"Opponent pool size: {self.self_play_manager.opponent_pool.size}")
         print("=" * 60)
         print("Press Ctrl+C to stop and save checkpoint")
@@ -655,7 +662,7 @@ class Trainer:
                     "loss": f"{ppo_stats.total_loss:.3f}",
                 }
                 if self.self_play_manager:
-                    postfix["elo"] = f"{self.self_play_manager.agent_elo:.0f}"
+                    postfix["skill"] = f"{self.self_play_manager.agent_skill:.0f}"
                 pbar.set_postfix(postfix)
 
                 # Add checkpoint to self-play pool
@@ -709,7 +716,7 @@ class Trainer:
         print(f"Total episodes: {self.stats.total_episodes:,}")
         print(f"Best win rate: {self.stats.best_win_rate:.1%}")
         if self.self_play_manager:
-            print(f"Final Elo: {self.self_play_manager.agent_elo:.0f}")
+            print(f"Final Skill: {self.self_play_manager.agent_skill:.0f}")
         print("=" * 60)
         print(f"\nTo resume training, run:")
         print(f"  python scripts/train.py --resume {self.save_dir / 'latest.pt'}")
@@ -743,14 +750,19 @@ class Trainer:
         # Self-play stats
         if self.self_play_manager:
             sp_stats = self.self_play_manager.get_stats()
-            self.writer.add_scalar("self_play/agent_elo", sp_stats["agent_elo"], step)
+            self.writer.add_scalar("self_play/agent_skill", sp_stats["agent_skill"], step)
             self.writer.add_scalar("self_play/pool_size", sp_stats["pool_size"], step)
-            self.writer.add_scalar("self_play/pool_avg_elo", sp_stats["pool_avg_elo"], step)
+            self.writer.add_scalar("self_play/pool_avg_skill", sp_stats["pool_avg_skill"], step)
             self.writer.add_scalar("self_play/games_vs_self_play", sp_stats["games_vs_self_play"], step)
             self.writer.add_scalar("self_play/games_vs_random", sp_stats["games_vs_random"], step)
 
     def _save_checkpoint(self, filename: str | None = None) -> None:
-        """Save a training checkpoint."""
+        """Save a training checkpoint.
+
+        Always updates latest.pt to point to the most recent checkpoint,
+        ensuring training can resume even after unexpected termination.
+        """
+        is_numbered = filename is None
         if filename is None:
             filename = f"checkpoint_{self.stats.total_timesteps}.pt"
 
@@ -771,7 +783,7 @@ class Trainer:
         # Save self-play state
         if self.self_play_manager:
             checkpoint["self_play"] = {
-                "agent_elo": self.self_play_manager.agent_elo,
+                "agent_skill": self.self_play_manager.agent_skill,
                 "last_checkpoint_timestep": self.self_play_manager.last_checkpoint_timestep,
                 "games_vs_self_play": self.self_play_manager.games_vs_self_play,
                 "games_vs_random": self.self_play_manager.games_vs_random,
@@ -779,6 +791,12 @@ class Trainer:
 
         torch.save(checkpoint, path)
         tqdm.write(f"Saved checkpoint: {path}")
+
+        # Always update latest.pt when saving numbered checkpoints
+        # This ensures resume works even after unexpected termination (kill/crash)
+        if is_numbered:
+            latest_path = self.save_dir / "latest.pt"
+            torch.save(checkpoint, latest_path)
 
     def load_checkpoint(self, path: str) -> None:
         """Load a training checkpoint."""
@@ -800,7 +818,8 @@ class Trainer:
         # Restore self-play state
         if self.self_play_manager and "self_play" in checkpoint:
             sp_state = checkpoint["self_play"]
-            self.self_play_manager.agent_elo = sp_state.get("agent_elo", 1000.0)
+            # Support both new "agent_skill" and old "agent_elo" keys for backwards compatibility
+            self.self_play_manager.agent_skill = sp_state.get("agent_skill", sp_state.get("agent_elo", 1000.0))
             self.self_play_manager.last_checkpoint_timestep = sp_state.get("last_checkpoint_timestep", 0)
             self.self_play_manager.games_vs_self_play = sp_state.get("games_vs_self_play", 0)
             self.self_play_manager.games_vs_random = sp_state.get("games_vs_random", 0)
@@ -810,4 +829,4 @@ class Trainer:
         print(f"  Episodes: {self.stats.total_episodes:,}")
         print(f"  Best win rate: {self.stats.best_win_rate:.1%}")
         if self.self_play_manager and "self_play" in checkpoint:
-            print(f"  Agent Elo: {self.self_play_manager.agent_elo:.0f}")
+            print(f"  Agent Skill: {self.self_play_manager.agent_skill:.0f}")

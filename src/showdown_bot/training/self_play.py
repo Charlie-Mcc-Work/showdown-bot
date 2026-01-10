@@ -20,7 +20,7 @@ class OpponentInfo:
     """Information about an opponent in the pool."""
 
     checkpoint_path: Path
-    elo_rating: float = 1000.0
+    skill_rating: float = 1000.0
     games_played: int = 0
     wins: int = 0
     losses: int = 0
@@ -140,7 +140,7 @@ class OpponentPool:
         self,
         model: PolicyValueNetwork,
         timestep: int,
-        elo_rating: float = 1000.0,
+        skill_rating: float = 1000.0,
     ) -> OpponentInfo:
         """Add a new opponent to the pool.
 
@@ -158,7 +158,7 @@ class OpponentPool:
 
         opponent_info = OpponentInfo(
             checkpoint_path=checkpoint_path,
-            elo_rating=elo_rating,
+            skill_rating=skill_rating,
             timestep_added=timestep,
         )
         self.opponents.append(opponent_info)
@@ -174,8 +174,8 @@ class OpponentPool:
         if len(self.opponents) <= self.max_size:
             return
 
-        # Sort by Elo rating
-        sorted_opponents = sorted(self.opponents, key=lambda x: x.elo_rating)
+        # Sort by skill rating
+        sorted_opponents = sorted(self.opponents, key=lambda x: x.skill_rating)
 
         # Keep best, worst, and evenly distributed others
         to_keep = set()
@@ -204,13 +204,13 @@ class OpponentPool:
     def sample_opponent(
         self,
         strategy: str = "uniform",
-        current_elo: float = 1000.0,
+        current_skill: float = 1000.0,
     ) -> OpponentInfo | None:
         """Sample an opponent from the pool.
 
         Args:
-            strategy: Sampling strategy ("uniform", "elo_matched", "prioritized")
-            current_elo: Current agent's Elo for matched sampling
+            strategy: Sampling strategy ("uniform", "skill_matched", "prioritized")
+            current_skill: Current agent's skill rating for matched sampling
 
         Returns:
             Selected opponent or None if pool is empty
@@ -221,12 +221,12 @@ class OpponentPool:
         if strategy == "uniform":
             return random.choice(self.opponents)
 
-        elif strategy == "elo_matched":
-            # Prefer opponents with similar Elo
+        elif strategy == "skill_matched":
+            # Prefer opponents with similar skill
             weights = []
             for opp in self.opponents:
-                elo_diff = abs(opp.elo_rating - current_elo)
-                weight = 1.0 / (1.0 + elo_diff / 100.0)
+                skill_diff = abs(opp.skill_rating - current_skill)
+                weight = 1.0 / (1.0 + skill_diff / 100.0)
                 weights.append(weight)
 
             total = sum(weights)
@@ -274,17 +274,17 @@ class OpponentPool:
         self,
         opponent_info: OpponentInfo,
         won: bool,
-        agent_elo: float,
+        agent_skill: float,
     ) -> tuple[float, float]:
         """Update opponent statistics after a game.
 
         Args:
             opponent_info: The opponent that was played against
             won: Whether the agent won
-            agent_elo: Current agent Elo
+            agent_skill: Current agent skill rating
 
         Returns:
-            Tuple of (new_agent_elo, new_opponent_elo)
+            Tuple of (new_agent_skill, new_opponent_skill)
         """
         opponent_info.games_played += 1
         if won:
@@ -292,15 +292,15 @@ class OpponentPool:
         else:
             opponent_info.wins += 1
 
-        # Update Elo ratings
-        new_agent_elo, new_opponent_elo = calculate_elo_update(
-            agent_elo,
-            opponent_info.elo_rating,
+        # Update skill ratings (using Elo algorithm internally)
+        new_agent_skill, new_opponent_skill = calculate_elo_update(
+            agent_skill,
+            opponent_info.skill_rating,
             won,
         )
-        opponent_info.elo_rating = new_opponent_elo
+        opponent_info.skill_rating = new_opponent_skill
 
-        return new_agent_elo, new_opponent_elo
+        return new_agent_skill, new_opponent_skill
 
     @property
     def size(self) -> int:
@@ -308,11 +308,11 @@ class OpponentPool:
         return len(self.opponents)
 
     @property
-    def average_elo(self) -> float:
-        """Average Elo rating in the pool."""
+    def average_skill(self) -> float:
+        """Average skill rating in the pool."""
         if not self.opponents:
             return 1000.0
-        return sum(o.elo_rating for o in self.opponents) / len(self.opponents)
+        return sum(o.skill_rating for o in self.opponents) / len(self.opponents)
 
 
 def calculate_elo_update(
@@ -356,7 +356,7 @@ class SelfPlayManager:
         max_pool_size: int = 10,
         self_play_ratio: float = 0.8,
         checkpoint_interval: int = 50000,
-        sampling_strategy: str = "elo_matched",
+        sampling_strategy: str = "skill_matched",
         device: torch.device | None = None,
     ):
         """Initialize self-play manager.
@@ -381,8 +381,9 @@ class SelfPlayManager:
             device=self.device,
         )
 
-        self.agent_elo = 1000.0
-        self.last_checkpoint_timestep = 0
+        self.agent_skill = 1000.0
+        # Initialize to negative interval so first checkpoint triggers at timestep 0
+        self.last_checkpoint_timestep = -checkpoint_interval
         self.games_vs_self_play = 0
         self.games_vs_random = 0
 
@@ -407,7 +408,7 @@ class SelfPlayManager:
         opponent_info = self.opponent_pool.add_opponent(
             model=model,
             timestep=timestep,
-            elo_rating=self.agent_elo,
+            skill_rating=self.agent_skill,
         )
         self.last_checkpoint_timestep = timestep
         return opponent_info
@@ -429,7 +430,7 @@ class SelfPlayManager:
         if self.should_use_self_play():
             opponent_info = self.opponent_pool.sample_opponent(
                 strategy=self.sampling_strategy,
-                current_elo=self.agent_elo,
+                current_skill=self.agent_skill,
             )
             if opponent_info:
                 player = self.opponent_pool.create_player(opponent_info, battle_format)
@@ -455,17 +456,17 @@ class SelfPlayManager:
             won: Whether the agent won
         """
         if opponent_info is not None:
-            self.agent_elo, _ = self.opponent_pool.update_stats(
-                opponent_info, won, self.agent_elo
+            self.agent_skill, _ = self.opponent_pool.update_stats(
+                opponent_info, won, self.agent_skill
             )
 
     def get_stats(self) -> dict[str, Any]:
         """Get self-play statistics."""
         total_games = self.games_vs_self_play + self.games_vs_random
         return {
-            "agent_elo": self.agent_elo,
+            "agent_skill": self.agent_skill,
             "pool_size": self.opponent_pool.size,
-            "pool_avg_elo": self.opponent_pool.average_elo,
+            "pool_avg_skill": self.opponent_pool.average_skill,
             "games_vs_self_play": self.games_vs_self_play,
             "games_vs_random": self.games_vs_random,
             "self_play_ratio_actual": (
