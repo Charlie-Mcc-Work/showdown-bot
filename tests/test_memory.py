@@ -280,7 +280,7 @@ class TestTrainerCleanup:
         )
 
     def test_cleanup_players_removes_model_attribute(self, trainer, model, device, tmp_path):
-        """Test that cleanup removes model from players with models."""
+        """Test that cleanup sets model to None to free memory."""
         # Create a mock player with a model
         mock_player = MagicMock()
         model = PolicyValueNetwork(
@@ -296,9 +296,8 @@ class TestTrainerCleanup:
         # Run cleanup
         asyncio.run(trainer._cleanup_players([mock_player]))
 
-        # Model should still exist but be on CPU (not deleted to avoid race conditions)
-        assert hasattr(mock_player, 'model')
-        assert next(mock_player.model.parameters()).device.type == "cpu"
+        # Model should be set to None to allow garbage collection
+        assert mock_player.model is None
 
     def test_cleanup_players_handles_players_without_model(self, trainer):
         """Test cleanup handles regular players without model attribute."""
@@ -348,9 +347,8 @@ class TestTrainerCleanup:
         # Should not raise, even with failing player
         asyncio.run(trainer._cleanup_players([failing_player, ok_player]))
 
-        # Second player's model should be on CPU (not deleted to avoid race conditions)
-        assert hasattr(ok_player, 'model')
-        assert next(ok_player.model.parameters()).device.type == "cpu"
+        # Second player's model should be set to None to allow GC
+        assert ok_player.model is None
 
 
 class TestMemoryLeakPrevention:

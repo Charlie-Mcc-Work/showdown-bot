@@ -1,6 +1,7 @@
 """Training loop for the Pokemon Showdown RL bot."""
 
 import asyncio
+import gc
 import logging
 import os
 import signal
@@ -368,17 +369,22 @@ class Trainer:
         # Wait for all cleanups to complete
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-            # Small delay to allow connections to fully close
-            await asyncio.sleep(0.1)
+            # Longer delay to allow pending websocket messages to drain
+            # This prevents race conditions where choose_move is called after cleanup
+            await asyncio.sleep(0.5)
 
-        # Free GPU memory from HistoricalPlayer models
-        # Only move to CPU - don't delete as websocket may still have pending messages
+        # Free memory from HistoricalPlayer models
+        # Set to None to break reference - choose_move has defensive check for this
         for player in players:
             if hasattr(player, 'model') and player.model is not None:
                 try:
-                    player.model.cpu()
+                    player.model.cpu()  # Move off GPU first
+                    player.model = None  # Break reference to allow GC
                 except Exception:
                     pass
+            # Also clear state encoder reference
+            if hasattr(player, 'state_encoder'):
+                player.state_encoder = None
 
     def _setup_signal_handlers(self) -> None:
         """Setup handlers for graceful shutdown."""
@@ -845,10 +851,12 @@ class Trainer:
                     self._best_win_rate = rollout_stats["win_rate"]  # For tuning
                     self._save_checkpoint("best_model.pt")
 
-                # Clean up opponent connections to prevent file descriptor leak
+                # Clean up opponent connections and free memory
                 await self._cleanup_players(opponents)
 
-                # Clear CUDA cache if available (doesn't affect active objects)
+                # Force garbage collection to free HistoricalPlayer models
+                # Safe now because _cleanup_players waits for websockets to drain
+                gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
