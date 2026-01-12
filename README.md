@@ -292,8 +292,9 @@ See [CLAUDE.md](CLAUDE.md) for detailed development progress.
 
 **Training Progress:**
 - Model: ~1.5M parameters (Transformer-based)
-- Current best: ~90% win rate against self-play opponents
-- Skill rating: 15,000+ (internal rating system)
+- Training: ~5.9M timesteps completed
+- Skill rating: 25,000+ (internal rating system)
+- Self-play opponents: 20 historical checkpoints
 
 ## License
 

@@ -46,11 +46,19 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
    The trainer now catches websocket errors, recreates players, and resumes training.
    See `collect_rollout_with_retry()` in `trainer.py`.
 
-2. **File descriptor leak (2026-01-08)**: FIXED - Opponents are now cleaned up after each
-   training loop iteration. Previously, HistoricalPlayer websocket connections accumulated
-   until hitting the system limit (~1024 open files). See line 678 in `trainer.py`.
+2. **Memory leak (2026-01-12)**: FIXED - HistoricalPlayer models are now properly released
+   after each training loop. The cleanup process:
+   - Stops websocket listeners and waits 0.5s for messages to drain
+   - Sets `player.model = None` and `player.state_encoder = None` to break references
+   - Calls `gc.collect()` to immediately free memory
+   - Defensive check in `choose_move()` returns random move if model is None (logs warning)
+   See `_cleanup_players()` in `trainer.py`.
 
-3. **Browser auth**: WORKAROUND - Use console login command.
+3. **File descriptor leak (2026-01-08)**: FIXED - Opponents are now cleaned up after each
+   training loop iteration. Previously, HistoricalPlayer websocket connections accumulated
+   until hitting the system limit (~1024 open files).
+
+4. **Browser auth**: WORKAROUND - Use console login command.
    The testclient's auth can be bypassed using the browser console:
    ```javascript
    app.socket.send('|/trn YourName,0,')
@@ -60,9 +68,18 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 ## Project Status
 
 **Current Phase**: Phase 4 - Training & Optimization (In Progress)
-**Last Updated**: 2026-01-08
+**Last Updated**: 2026-01-12
 
 ### Recent Changes
+- **Memory leak fix (2026-01-12)**: Fixed HistoricalPlayer models not being garbage collected
+  - Models now set to None after cleanup to break reference cycles
+  - Added 0.5s delay for websocket message draining
+  - Added gc.collect() after opponent cleanup
+  - Defensive check in choose_move() with warning logging
+  - Added comprehensive memory management tests (tests/test_memory.py)
+- **Quick start guide (2026-01-12)**: Added step-by-step browser play instructions to README
+- **Graceful shutdown fix (2026-01-12)**: Suppressed noisy websocket close messages during Ctrl+C
+- **Empty buffer handling (2026-01-12)**: PPO update now handles empty buffer during shutdown
 - **OU Module (2026-01-08)**: Added Gen 9 OU expansion module with teambuilding and player components
   - See `src/showdown_bot/ou/README.md` for full architecture
   - Shared embeddings for Pokemon, moves, items, abilities
@@ -70,22 +87,11 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
   - OU-specific state encoder with opponent prediction
   - Team preview lead selection
 - **File descriptor leak fix (2026-01-08)**: Fixed opponents not being cleaned up after training loops
-- **Extension page context fix**: Uses `world: "MAIN"` and `app.curRoom.request` for proper PS integration
-- **torch.load warnings**: Added explicit `weights_only` parameter to suppress FutureWarnings
 - **Browser coaching extension complete**: Full model integration with BrowserStateEncoder
-- **Extension icons**: Auto-generated Pokeball-style icons (scripts/create_icons.py)
-- **Comprehensive tests**: 23 new tests for coaching server (tests/test_coach.py)
-- **Coach server improvements**: Model inference, heuristic fallback, action masking
-- **Dependencies updated**: Added pytest, flask-cors to dev dependencies
 - **Websocket error fix**: Added automatic retry with connection recovery in trainer
-- **Training note**: Training REQUIRES local Pokemon Showdown server running on port 8000
 - Implemented Optuna-based hyperparameter tuning system (scripts/tune.py)
 - Added parallel environment support (--num-envs flag, ~360 it/s with 4 envs)
-- Trainer now accepts injectable TrainingConfig for tuning
-- Integrated self-play training into main trainer
 - Added graceful Ctrl+C shutdown with checkpoint saving
-- Added `--resume` flag for easy training continuation
-- Verified GPU training with parallel environments
 
 ### Progress Tracker
 
@@ -273,43 +279,31 @@ cd ~/pokemon-showdown && node pokemon-showdown start --no-security
 - `src/showdown_bot/environment/state_encoder.py` - State encoding
 
 ### Browser Play (Working)
-Play against the trained bot in a web browser.
+Play against the trained bot in a web browser using 3 terminals:
 
-**Quick Start:**
+**Terminal 1: Start Pokemon Showdown Server**
 ```bash
-# Run the all-in-one setup script:
-./scripts/start_local_play.sh
-# Then open: http://localhost:8081/local-client.html
+cd ~/pokemon-showdown && node pokemon-showdown start --no-security
 ```
 
-**Manual Setup:**
+**Terminal 2: Start HTTP Server**
 ```bash
-# 1. Start the Pokemon Showdown server
-cd ~/pokemon-showdown
-node pokemon-showdown start --no-security
-
-# 2. Start the HTTP server for the client
-cd ~/pokemon-showdown-client
-npx http-server -p 8080 -c-1
-
-# 3. Start the bot
-cd ~/Documents/Programming/Charlie-Mcc-Work/showdown-bot
-.venv-rocm/bin/python scripts/play.py
-
-# 4. Open browser to:
-# http://localhost:8080/play.pokemonshowdown.com/testclient.html?~~localhost:8000
-
-# 5. Login via browser console (F12 > Console):
-# app.socket.send('|/trn YourName,0,')
-
-# 6. Challenge "TrainedBot" to a gen9randombattle!
+cd ~/showdown-bot && ./scripts/start_local_play.sh
 ```
 
-**Note**: The testclient requires a console command to login because it tries to verify
-authentication signatures. The `/trn username,0,` command bypasses this for local servers.
-See `browser/local-client.html` for a bookmarklet that makes this easier.
+**Terminal 3: Start the Bot**
+```bash
+cd ~/showdown-bot
+source .venv/bin/activate  # or .venv-rocm/bin/activate
+python scripts/play.py
+```
 
-**Ultimate Goal**: Bot watches user play and suggests optimal moves (Phase 6).
+**In Browser:**
+1. Open: `http://localhost:8080/play.pokemonshowdown.com/testclient.html?~~localhost:8000`
+2. Open console (F12) and login: `app.socket.send('|/trn YourName,0,')`
+3. Challenge bot: `app.socket.send('|/challenge TrainedBot, gen9randombattle')`
+
+Or use UI: Click "Find a user" → "TrainedBot" → "Challenge" → "gen9randombattle"
 
 ### Running Tests
 ```bash
