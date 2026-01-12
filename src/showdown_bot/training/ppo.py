@@ -79,6 +79,18 @@ class PPO:
         Returns:
             Statistics from the update
         """
+        # Handle empty buffer (e.g., during shutdown)
+        if buffer.size == 0:
+            return PPOStats(
+                policy_loss=0.0,
+                value_loss=0.0,
+                entropy_loss=0.0,
+                total_loss=0.0,
+                approx_kl=0.0,
+                clip_fraction=0.0,
+                explained_variance=0.0,
+            )
+
         # Track statistics
         total_policy_loss = 0.0
         total_value_loss = 0.0

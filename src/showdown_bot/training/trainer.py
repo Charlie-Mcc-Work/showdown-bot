@@ -1,6 +1,8 @@
 """Training loop for the Pokemon Showdown RL bot."""
 
 import asyncio
+import logging
+import os
 import signal
 import sys
 import time
@@ -30,6 +32,89 @@ from showdown_bot.training.self_play import SelfPlayManager
 # Maximum retries for websocket connection errors
 MAX_ROLLOUT_RETRIES = 3
 RETRY_DELAY_SECONDS = 5.0
+
+# Memory thresholds for automatic shutdown
+MEMORY_SOFT_LIMIT_PERCENT = 80.0  # Graceful shutdown with checkpoint
+MEMORY_HARD_LIMIT_PERCENT = 95.0  # Force quit
+
+
+class MemoryMonitor:
+    """Monitors system memory usage and triggers shutdown if thresholds exceeded."""
+
+    def __init__(
+        self,
+        soft_limit_percent: float = MEMORY_SOFT_LIMIT_PERCENT,
+        hard_limit_percent: float = MEMORY_HARD_LIMIT_PERCENT,
+    ):
+        """Initialize memory monitor.
+
+        Args:
+            soft_limit_percent: Memory % that triggers graceful shutdown (default 80%)
+            hard_limit_percent: Memory % that triggers force quit (default 95%)
+        """
+        self.soft_limit_percent = soft_limit_percent
+        self.hard_limit_percent = hard_limit_percent
+        self._total_memory: int | None = None
+
+    def get_memory_info(self) -> tuple[int, int, float]:
+        """Get current memory usage from /proc/meminfo.
+
+        Returns:
+            Tuple of (used_bytes, total_bytes, percent_used)
+        """
+        try:
+            with open("/proc/meminfo", "r") as f:
+                meminfo = {}
+                for line in f:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        # Values are in kB
+                        key = parts[0].rstrip(":")
+                        value = int(parts[1]) * 1024  # Convert to bytes
+                        meminfo[key] = value
+
+            total = meminfo.get("MemTotal", 0)
+            available = meminfo.get("MemAvailable", 0)
+            used = total - available
+            percent = (used / total * 100) if total > 0 else 0.0
+
+            self._total_memory = total
+            return used, total, percent
+
+        except (OSError, ValueError, KeyError):
+            # Fallback if /proc/meminfo is unavailable
+            return 0, 0, 0.0
+
+    def check_memory(self) -> tuple[str, float]:
+        """Check memory and return status.
+
+        Returns:
+            Tuple of (status, percent_used) where status is one of:
+            - "ok": Memory usage is acceptable
+            - "soft_limit": Memory exceeds soft limit, should gracefully shutdown
+            - "hard_limit": Memory exceeds hard limit, must force quit
+        """
+        used, total, percent = self.get_memory_info()
+
+        if percent >= self.hard_limit_percent:
+            return "hard_limit", percent
+        elif percent >= self.soft_limit_percent:
+            return "soft_limit", percent
+        else:
+            return "ok", percent
+
+    def format_memory(self, bytes_val: int) -> str:
+        """Format bytes as human-readable string."""
+        for unit in ["B", "KB", "MB", "GB"]:
+            if bytes_val < 1024:
+                return f"{bytes_val:.1f} {unit}"
+            bytes_val /= 1024
+        return f"{bytes_val:.1f} TB"
+
+    def get_memory_status_string(self) -> str:
+        """Get a formatted string of current memory status."""
+        used, total, percent = self.get_memory_info()
+        return f"{self.format_memory(used)}/{self.format_memory(total)} ({percent:.1f}%)"
 
 
 class TrainablePlayer(Player):
@@ -243,6 +328,10 @@ class Trainer:
 
         # Graceful shutdown
         self._shutdown_requested = False
+        self._memory_shutdown = False  # Triggered by memory monitor
+
+        # Memory monitor for automatic shutdown on high memory usage
+        self.memory_monitor = MemoryMonitor()
 
         # Track active players for cleanup
         self._active_players: list[TrainablePlayer] = []
@@ -266,7 +355,7 @@ class Trainer:
         return players
 
     async def _cleanup_players(self, players: list[Player]) -> None:
-        """Clean up player websocket connections gracefully."""
+        """Clean up player websocket connections and free GPU memory."""
         cleanup_tasks = []
         for player in players:
             try:
@@ -282,27 +371,29 @@ class Trainer:
             # Small delay to allow connections to fully close
             await asyncio.sleep(0.1)
 
+        # Free GPU memory from HistoricalPlayer models
+        # Only move to CPU - don't delete as websocket may still have pending messages
+        for player in players:
+            if hasattr(player, 'model') and player.model is not None:
+                try:
+                    player.model.cpu()
+                except Exception:
+                    pass
+
     def _setup_signal_handlers(self) -> None:
         """Setup handlers for graceful shutdown."""
         def signal_handler(signum, frame):
             if self._shutdown_requested:
                 print("\nForce quitting...")
-                # Cancel all running tasks
-                for task in asyncio.all_tasks():
-                    if not task.done():
-                        task.cancel()
                 sys.exit(1)
             print("\n\nShutdown requested. Saving checkpoint...")
             print("Press Ctrl+C again to force quit.")
             self._shutdown_requested = True
-            # Cancel running tasks to speed up shutdown
-            try:
-                loop = asyncio.get_running_loop()
-                for task in asyncio.all_tasks(loop):
-                    if task is not asyncio.current_task() and not task.done():
-                        task.cancel()
-            except RuntimeError:
-                pass  # No running loop
+
+            # Suppress poke-env websocket error messages during shutdown
+            # These are harmless "ConnectionClosedOK" messages from closing mid-battle
+            logging.getLogger("poke_env").setLevel(logging.CRITICAL)
+            logging.getLogger("websockets").setLevel(logging.CRITICAL)
 
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
@@ -621,6 +712,8 @@ class Trainer:
         if self.self_play_manager:
             print(f"Agent Skill: {self.self_play_manager.agent_skill:.0f}")
             print(f"Opponent pool size: {self.self_play_manager.opponent_pool.size}")
+        print(f"Memory: {self.memory_monitor.get_memory_status_string()}")
+        print(f"Memory limits: soft={self.memory_monitor.soft_limit_percent}%, hard={self.memory_monitor.hard_limit_percent}%")
         print("=" * 60)
         print("Press Ctrl+C to stop and save checkpoint")
         print("=" * 60)
@@ -637,6 +730,24 @@ class Trainer:
 
         try:
             while self.stats.total_timesteps < total_timesteps and not self._shutdown_requested:
+                # Check memory usage at the start of each iteration
+                mem_status, mem_percent = self.memory_monitor.check_memory()
+                if mem_status == "hard_limit":
+                    tqdm.write(
+                        f"\n[CRITICAL] Memory usage at {mem_percent:.1f}% - FORCE QUITTING!"
+                    )
+                    tqdm.write("Attempting emergency checkpoint save...")
+                    self._save_checkpoint("emergency_memory_checkpoint.pt")
+                    tqdm.write(f"Emergency checkpoint saved.")
+                    sys.exit(1)
+                elif mem_status == "soft_limit":
+                    tqdm.write(
+                        f"\n[WARNING] Memory usage at {mem_percent:.1f}% - initiating graceful shutdown"
+                    )
+                    self._shutdown_requested = True
+                    self._memory_shutdown = True
+                    break
+
                 # Reset buffer and all player stats
                 self.buffer.reset()
                 for player in players:
@@ -737,6 +848,10 @@ class Trainer:
                 # Clean up opponent connections to prevent file descriptor leak
                 await self._cleanup_players(opponents)
 
+                # Clear CUDA cache if available (doesn't affect active objects)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
         except asyncio.CancelledError:
             # Task was cancelled during shutdown - this is expected
             print("\nTraining cancelled.")
@@ -749,7 +864,6 @@ class Trainer:
             # Clean up player connections
             try:
                 await self._cleanup_players(players)
-                await self._cleanup_players(opponents)
             except Exception:
                 pass  # Ignore cleanup errors
 
@@ -763,7 +877,10 @@ class Trainer:
                 self.writer.close()
 
         print("\n" + "=" * 60)
-        if self._shutdown_requested:
+        if self._memory_shutdown:
+            print("Training Stopped - HIGH MEMORY USAGE (checkpoint saved)")
+            print(f"Memory at shutdown: {self.memory_monitor.get_memory_status_string()}")
+        elif self._shutdown_requested:
             print("Training Stopped (checkpoint saved)")
         else:
             print("Training Complete!")

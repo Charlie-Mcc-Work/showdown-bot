@@ -708,3 +708,84 @@ class TestPPOStatsDataclass:
         assert stats.approx_kl == 0.005
         assert stats.clip_fraction == 0.1
         assert stats.explained_variance == 0.8
+
+
+class TestEmptyBufferHandling:
+    """Test handling of empty buffers (e.g., during Ctrl+C shutdown)."""
+
+    def test_get_batches_empty_buffer(self):
+        """Test get_batches returns empty list when buffer is empty."""
+        buffer = RolloutBuffer(buffer_size=128, num_envs=4)
+        # Buffer is empty (ptr=0)
+        assert buffer.size == 0
+
+        batches = buffer.get_batches(batch_size=64)
+        assert batches == []
+
+    def test_get_batches_zero_batch_size(self):
+        """Test get_batches returns empty list when batch_size is 0."""
+        buffer = RolloutBuffer(buffer_size=128, num_envs=4)
+        # Add some data
+        buffer.add(
+            player_pokemon=np.zeros((4, 6, StateEncoder.POKEMON_FEATURES)),
+            opponent_pokemon=np.zeros((4, 6, StateEncoder.POKEMON_FEATURES)),
+            player_active_idx=0,
+            opponent_active_idx=0,
+            field_state=np.zeros((4, StateEncoder.FIELD_FEATURES)),
+            action_mask=np.ones((4, 9)),
+            action=np.array([0, 0, 0, 0]),
+            log_prob=np.zeros(4),
+            reward=np.zeros(4),
+            done=False,
+            value=np.zeros(4),
+        )
+
+        batches = buffer.get_batches(batch_size=0)
+        assert batches == []
+
+    def test_ppo_update_empty_buffer(self):
+        """Test PPO update handles empty buffer gracefully."""
+        model = PolicyValueNetwork.from_config()
+        ppo = PPO(model=model)
+        buffer = RolloutBuffer(buffer_size=128, num_envs=4)
+
+        # Buffer is empty - should not raise an error
+        stats = ppo.update(buffer, batch_size=64)
+
+        # Should return zero stats
+        assert stats.policy_loss == 0.0
+        assert stats.value_loss == 0.0
+        assert stats.entropy_loss == 0.0
+        assert stats.total_loss == 0.0
+        assert stats.approx_kl == 0.0
+        assert stats.clip_fraction == 0.0
+        assert stats.explained_variance == 0.0
+
+    def test_ppo_update_after_reset(self):
+        """Test PPO update after buffer reset (simulates mid-rollout shutdown)."""
+        model = PolicyValueNetwork.from_config()
+        ppo = PPO(model=model)
+        buffer = RolloutBuffer(buffer_size=128, num_envs=4)
+
+        # Add data, then reset (simulates partial rollout interrupted)
+        buffer.add(
+            player_pokemon=np.zeros((4, 6, StateEncoder.POKEMON_FEATURES)),
+            opponent_pokemon=np.zeros((4, 6, StateEncoder.POKEMON_FEATURES)),
+            player_active_idx=0,
+            opponent_active_idx=0,
+            field_state=np.zeros((4, StateEncoder.FIELD_FEATURES)),
+            action_mask=np.ones((4, 9)),
+            action=np.array([0, 0, 0, 0]),
+            log_prob=np.zeros(4),
+            reward=np.zeros(4),
+            done=False,
+            value=np.zeros(4),
+        )
+        buffer.reset()
+
+        # After reset, buffer should be empty
+        assert buffer.size == 0
+
+        # PPO update should handle this gracefully
+        stats = ppo.update(buffer, batch_size=64)
+        assert stats.total_loss == 0.0

@@ -150,6 +150,11 @@ class RolloutBuffer:
             List of dictionaries containing batched tensors
         """
         total_size = self.ptr * self.num_envs
+
+        # Handle empty buffer or zero batch size
+        if total_size == 0 or batch_size <= 0:
+            return []
+
         indices = np.arange(total_size)
 
         if shuffle:

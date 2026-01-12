@@ -66,6 +66,11 @@ class HistoricalPlayer(Player):
 
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Choose a move using the loaded model."""
+        # Handle cleanup race condition - model may be deleted while websocket
+        # still has pending messages
+        if not hasattr(self, 'model') or self.model is None:
+            return self.choose_random_move(battle)
+
         state = self.state_encoder.encode_battle(battle)
 
         player_pokemon = state.player_pokemon.unsqueeze(0).to(self.device)

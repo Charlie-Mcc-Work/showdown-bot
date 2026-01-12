@@ -2,6 +2,52 @@
 
 A reinforcement learning bot that plays Pokemon Showdown Gen 9 Random Battles using self-play training.
 
+## Quick Start: Play Against the Bot
+
+Play against the trained bot in your browser in 3 terminals:
+
+### Terminal 1: Start Pokemon Showdown Server
+```bash
+cd ~/pokemon-showdown && node pokemon-showdown start --no-security
+```
+
+If you don't have the server installed:
+```bash
+git clone https://github.com/smogon/pokemon-showdown.git ~/pokemon-showdown
+cd ~/pokemon-showdown && npm install
+node pokemon-showdown start --no-security
+```
+
+### Terminal 2: Start the HTTP Server
+```bash
+cd ~/showdown-bot
+./scripts/start_local_play.sh
+```
+
+### Terminal 3: Start the Bot
+```bash
+cd ~/showdown-bot
+source .venv/bin/activate  # or .venv-rocm/bin/activate for ROCm
+python scripts/play.py
+```
+
+### In Your Browser
+1. Open: `http://localhost:8080/play.pokemonshowdown.com/testclient.html?~~localhost:8000`
+
+2. Open browser console (F12 > Console) and login:
+   ```javascript
+   app.socket.send('|/trn YourName,0,')
+   ```
+
+3. Challenge the bot:
+   ```javascript
+   app.socket.send('|/challenge TrainedBot, gen9randombattle')
+   ```
+
+   Or use the UI: Click "Find a user" → type "TrainedBot" → "Challenge" → select "gen9randombattle"
+
+---
+
 ## Features
 
 - **PPO-based RL**: Uses Proximal Policy Optimization for stable training
@@ -184,27 +230,7 @@ python scripts/evaluate.py -c data/checkpoints/best_model.pt --opponent max_dama
 
 ---
 
-## Playing Against the Bot
-
-### In Browser (Local Server)
-
-```bash
-# 1. Start Pokemon Showdown server
-cd ~/pokemon-showdown && node pokemon-showdown start --no-security
-
-# 2. Start the bot
-python scripts/play.py
-
-# 3. Open browser
-# http://localhost:8080/play.pokemonshowdown.com/testclient.html?~~localhost:8000
-
-# 4. Login via browser console (F12 > Console):
-# app.socket.send('|/trn YourName,0,')
-
-# 5. Challenge "TrainedBot" to gen9randombattle
-```
-
-### AI Coach (Browser Extension)
+## AI Coach (Browser Extension)
 
 Get move suggestions while playing on play.pokemonshowdown.com:
 
