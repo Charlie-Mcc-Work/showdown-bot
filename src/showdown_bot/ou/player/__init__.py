@@ -21,6 +21,15 @@ from showdown_bot.ou.player.team_preview import (
     HeuristicLeadSelector,
     TeamPreviewAnalyzer,
 )
+from showdown_bot.ou.player.ou_player import (
+    OURLPlayer,
+    OUTrainablePlayer,
+    OUNeuralNetworkPlayer,
+    OUMaxDamagePlayer,
+    OUTeambuilder,
+    calculate_ou_reward,
+    _get_team_preview_order,
+)
 
 __all__ = [
     "OUStateEncoder",
@@ -30,4 +39,11 @@ __all__ = [
     "TeamPreviewSelector",
     "HeuristicLeadSelector",
     "TeamPreviewAnalyzer",
+    "OURLPlayer",
+    "OUTrainablePlayer",
+    "OUNeuralNetworkPlayer",
+    "OUMaxDamagePlayer",
+    "OUTeambuilder",
+    "calculate_ou_reward",
+    "_get_team_preview_order",
 ]

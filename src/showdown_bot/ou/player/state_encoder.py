@@ -396,3 +396,64 @@ class OUStateEncoder:
             mask[0] = 1.0
 
         return mask
+
+    def action_to_battle_order(
+        self,
+        action: int,
+        battle: AbstractBattle,
+    ) -> "BattleOrder | None":
+        """Convert action index to poke-env battle order.
+
+        Action space (13 actions):
+        - 0-3: Regular moves
+        - 4-7: Tera moves (same move but with terastallization)
+        - 8-12: Switch to Pokemon 0-4
+
+        Args:
+            action: Action index (0-12)
+            battle: Current battle state
+
+        Returns:
+            BattleOrder or None if action is invalid
+        """
+        from poke_env.player.battle_order import BattleOrder
+
+        # During forced switch, only switch actions are valid
+        if battle.force_switch:
+            if action < 8:
+                # Model tried to use a move during forced switch - invalid
+                return None
+            # Fall through to switch handling below
+
+        if action < 4:
+            # Regular move action
+            available_moves = battle.available_moves
+            if action < len(available_moves):
+                move = available_moves[action]
+                return BattleOrder(move)
+
+        elif action < 8:
+            # Tera move action (same moves but with tera)
+            move_idx = action - 4
+            available_moves = battle.available_moves
+
+            if move_idx < len(available_moves) and battle.can_tera:
+                move = available_moves[move_idx]
+                return BattleOrder(move, terastallize=True)
+            elif move_idx < len(available_moves):
+                # Can't tera, fall back to regular move
+                return BattleOrder(available_moves[move_idx])
+
+        else:
+            # Switch action (8-12 -> switch to team slot 0-4)
+            switch_idx = action - 8
+            available_switches = battle.available_switches
+            team_list = [p for p in battle.team.values() if p != battle.active_pokemon]
+
+            for pokemon in available_switches:
+                if pokemon in team_list:
+                    idx = team_list.index(pokemon)
+                    if idx == switch_idx:
+                        return BattleOrder(pokemon)
+
+        return None

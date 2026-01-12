@@ -225,13 +225,22 @@ class PokemonDataLoader:
                 # Extract base stats
                 base_stats = data.get("baseStats", {})
 
+                # Collect abilities for later
+                abilities_dict = data.get("abilities", {})
+                for ability_name in abilities_dict.values():
+                    ability_norm = ability_name.lower().replace(" ", "").replace("-", "")
+                    if ability_norm not in self.ability_to_id:
+                        ability_id = len(self.ability_to_id) + 1
+                        self.ability_to_id[ability_norm] = ability_id
+                        self.id_to_ability[ability_id] = ability_norm
+
                 self.pokemon_data[name] = PokemonData(
                     species_id=species_id,
                     name=name,
                     types=(type1, type2),
                     base_stats=base_stats,
-                    abilities=list(data.get("abilities", {}).values()),
-                    hidden_ability=data.get("abilities", {}).get("H"),
+                    abilities=list(abilities_dict.values()),
+                    hidden_ability=abilities_dict.get("H"),
                     move_pool=[],  # Would need learnset data
                     tier=data.get("tier", ""),
                     base_stat_total=sum(base_stats.values()),
@@ -256,17 +265,34 @@ class PokemonDataLoader:
                     effect=data.get("shortDesc", ""),
                 )
 
-            # Load items
-            for i, (name, data) in enumerate(gen_data.items.items()):
+            # Load items - GenData doesn't have items directly, so define common competitive items
+            common_items = [
+                "leftovers", "choicescarf", "choiceband", "choicespecs",
+                "lifeorb", "heavydutyboots", "rockyhelmet", "assaultvest",
+                "focussash", "eviolite", "blacksludge", "airballoon",
+                "expertbelt", "lumberry", "sitrusberry", "safetygoggles",
+                "covertcloak", "boosterenergy", "mirrorherb", "clearamulet",
+                "loadeddice", "protectivepads", "shedshell", "redcard",
+                "weaknesspolicy", "throatspray", "blunderpolicy", "roomservice",
+                "ejectbutton", "ejectpack", "mentalherb", "powerherb",
+                "whiteherb", "flameorb", "toxicorb", "lightclay",
+                "terrainextender", "heatrock", "damprock", "icyrock",
+                "smoothrock", "lightball", "thickclub", "souldew",
+                "shellbell", "wideslens", "zoomlens", "scopelens",
+                "razorclaw", "muscleband", "wiseglasses", "metronome",
+                "gripclaw", "bindingband", "stickybarb", "ironball",
+                "ringtarget", "destinyknot", "macho brace", "chokeberry",
+                "aguavberry", "figyberry", "iapapaberry", "wikiberry",
+                "occaberry", "passhoberry", "wacanberry", "rindoberry",
+                "yacheberry", "chopleberry", "kebiaberry", "shucaberry",
+                "cobaberry", "payapaberry", "tangaberry", "chartiberry",
+                "kasibberry", "habanberry", "colburberry", "babiriberry",
+                "chilanberry", "roseliberry",
+            ]
+            for i, item in enumerate(common_items):
                 item_id = i + 1
-                self.item_to_id[name] = item_id
-                self.id_to_item[item_id] = name
-
-            # Load abilities
-            for i, (name, data) in enumerate(gen_data.abilities.items()):
-                ability_id = i + 1
-                self.ability_to_id[name] = ability_id
-                self.id_to_ability[ability_id] = name
+                self.item_to_id[item] = item_id
+                self.id_to_item[item_id] = item
 
         except ImportError:
             print("Warning: poke-env not available, using empty data")

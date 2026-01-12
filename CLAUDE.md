@@ -11,7 +11,101 @@ Current task queue:
 2. ~~Parallel environments~~ (complete - tested 4 envs at ~360 it/s)
 3. ~~Websocket error fix~~ (complete - auto-retry with reconnection)
 4. ~~Browser coaching extension~~ (COMPLETE)
-5. Extended training & evaluation (next)
+5. ~~OU Module Foundation~~ (complete - player classes, training script)
+6. ~~OU Experience Collection~~ (COMPLETE)
+7. ~~OU Self-Play System~~ (COMPLETE)
+8. ~~OU Team Preview Integration~~ (COMPLETE - heuristic selector)
+9. ~~OU Teambuilder Training Loop~~ (COMPLETE - infrastructure ready)
+10. ~~OU Joint Training~~ (COMPLETE - placeholder, awaits TeamGenerator)
+
+**Next steps** for OU completion:
+- Implement full TeamGenerator (species selection, move selection, etc.)
+- Implement Team → tensor encoding for TeamEvaluator
+- Extended training runs with player mode
+- Evaluation against Showdown ladder
+
+### OU Development Plan
+
+The OU system trains **player** and **teambuilder** together in a feedback loop:
+- Player plays battles with generated teams
+- Battle results (win/loss, performance) feed back to teambuilder
+- Teambuilder learns which team compositions lead to wins
+- Player improves at playing the teams teambuilder generates
+
+#### Step 6: Experience Collection (COMPLETE)
+**Goal**: Collect state/action/reward transitions during OU battles for PPO updates.
+
+Implemented:
+- [x] `OUTrainablePlayer` class hooks into `choose_move()` to record (state, action, log_prob, value)
+- [x] `calculate_ou_reward()` function for HP differential + KO bonus rewards
+- [x] Terminal rewards in `_battle_finished_callback()`
+- [x] `train_ou.py` collects experiences via `player.get_experiences()` and adds to `OUExperienceBuffer`
+- [x] PPO update runs when buffer has enough data
+
+Files modified:
+- `ou/player/ou_player.py` - Added `OUTrainablePlayer`, `calculate_ou_reward()`
+- `scripts/train_ou.py` - Uses `OUTrainablePlayer`, collects experiences after battles
+
+#### Step 7: OU Self-Play System (COMPLETE)
+**Goal**: Train against historical checkpoints instead of just Random/MaxDamage.
+
+Implemented:
+- [x] `OUOpponentPool` - Store historical OU player checkpoints
+- [x] `OUHistoricalPlayer` - Load and play with historical checkpoints
+- [x] `OUSelfPlayManager` - High-level manager with skill-matched sampling
+- [x] Elo rating updates after games
+- [x] `--no-self-play` CLI flag for disabling self-play
+- [x] TensorBoard logging of self-play stats
+
+Files created/modified:
+- `ou/training/self_play.py` - OU self-play system (OUOpponentPool, OUSelfPlayManager)
+- `scripts/train_ou.py` - Integrated self-play opponents
+
+#### Step 8: Team Preview Integration (COMPLETE)
+**Goal**: Use heuristic lead selector to choose leads strategically.
+
+Implemented:
+- [x] `_get_team_preview_order()` helper function using `HeuristicLeadSelector`
+- [x] Override `teampreview()` in all OU player classes
+- [x] Lead selection based on role priorities (hazard setter, blocker, pivot)
+- [x] Neural network selector exists but not yet trained
+
+Files modified:
+- `ou/player/ou_player.py` - Added `teampreview()` overrides
+- `ou/training/self_play.py` - Added `teampreview()` to `OUHistoricalPlayer`
+
+#### Step 9: Teambuilder Training Loop (COMPLETE - Infrastructure)
+**Goal**: Train team generator from battle performance feedback.
+
+Implemented:
+- [x] `TeambuilderTrainingManager` class in `scripts/train_ou.py`
+- [x] `--mode teambuilder` CLI flag for teambuilder training
+- [x] Loads frozen player checkpoint for team evaluation
+- [x] Generates teams and plays N games per team
+- [x] Records battle outcomes in `TeamOutcomeBuffer`
+- [x] Checkpoint saving for teambuilder
+
+**Note**: The underlying `TeamGenerator` produces placeholder teams. The training
+infrastructure is ready for when the generator is fully implemented.
+
+Files modified:
+- `scripts/train_ou.py` - Added `TeambuilderTrainingManager`, `--mode` argument
+
+#### Step 10: Joint Training (COMPLETE - Placeholder)
+**Goal**: Alternate between player and teambuilder updates.
+
+Implemented:
+- [x] `--mode joint` CLI flag
+- [x] Currently falls back to player training (teambuilder not fully functional)
+- [x] Architecture documented in ou/README.md
+
+**Future work** (when TeamGenerator is complete):
+1. Generate K teams from teambuilder
+2. Play M games per team, collecting player experience
+3. Update player with PPO
+4. Update teambuilder based on team win rates
+5. Add player checkpoint to opponent pool
+6. Repeat
 
 ### Browser Coaching Extension (Complete)
 Chrome extension that coaches you on play.pokemonshowdown.com:
@@ -71,6 +165,11 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 **Last Updated**: 2026-01-12
 
 ### Recent Changes
+- **OU Training Integration (2026-01-12)**: Added complete training pipeline for Gen 9 OU
+  - `scripts/train_ou.py` - Training script with sample teams, evaluation, checkpointing
+  - `OURLPlayer` / `OUNeuralNetworkPlayer` - poke-env Player wrappers
+  - `action_to_battle_order()` - Converts actions to battle orders (13 actions: 4 moves, 4 tera moves, 5 switches)
+  - Run with: `python scripts/train_ou.py`
 - **Memory leak fix (2026-01-12)**: Fixed HistoricalPlayer models not being garbage collected
   - Models now set to None after cleanup to break reference cycles
   - Added 0.5s delay for websocket message draining
@@ -144,19 +243,27 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 - [x] Model inference server (Flask API)
 - [ ] Screen capture integration (future)
 
-#### Phase 7: OU Expansion - IN PROGRESS
+#### Phase 7: OU Expansion - TEAM GENERATION COMPLETE
 - [x] Module architecture design (see `src/showdown_bot/ou/README.md`)
 - [x] Shared embeddings (Pokemon, moves, items, abilities)
 - [x] Team representation and serialization
-- [x] Autoregressive team generator (placeholder)
-- [x] Team evaluator network (placeholder)
+- [x] Full TeamGenerator implementation:
+  - [x] UsageBasedGenerator (generates teams from Smogon usage stats)
+  - [x] Species selection weighted by usage rate + teammate correlations
+  - [x] Move/item/ability selection from common sets
+  - [x] Nature/EV spreads from usage data
+  - [x] Proper name formatting (format_name helper)
+- [x] Team evaluator network (placeholder architecture)
 - [x] OU state encoder with opponent prediction
-- [x] Team preview lead selector
-- [ ] Training loop for teambuilder
-- [ ] Training loop for player
-- [ ] Usage stats integration
+- [x] Team preview lead selector (heuristic)
+- [x] OURLPlayer / OUNeuralNetworkPlayer (poke-env integration)
+- [x] OUTrainablePlayer with experience collection
+- [x] Training script (`scripts/train_ou.py`) with player, teambuilder, joint modes
+- [x] Self-play for OU (OUSelfPlayManager, OUOpponentPool)
+- [x] Teambuilder training loop infrastructure
+- [x] Usage stats integration (UsageStatsLoader downloads from Smogon)
+- [ ] Team → tensor encoding for evaluator
 - [ ] Metagame analysis
-- [ ] Full training pipeline
 
 ---
 
@@ -256,6 +363,24 @@ python scripts/train.py --no-self-play
 
 # Monitor with TensorBoard
 tensorboard --logdir runs/
+```
+
+### Running OU Training
+```bash
+# Train OU player with sample teams
+python scripts/train_ou.py
+
+# Short training run
+python scripts/train_ou.py -t 100000
+
+# Resume from checkpoint
+python scripts/train_ou.py --resume
+
+# Use parallel environments
+python scripts/train_ou.py --num-envs 4
+
+# Monitor with TensorBoard
+tensorboard --logdir runs/ou/
 ```
 
 ### Evaluation

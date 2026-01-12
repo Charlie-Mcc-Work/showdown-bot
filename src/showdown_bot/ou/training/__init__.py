@@ -22,6 +22,30 @@ from showdown_bot.ou.training.buffer import (
 )
 from showdown_bot.ou.training.player_trainer import OUPlayerTrainer
 from showdown_bot.ou.training.teambuilder_trainer import TeambuilderTrainer
+from showdown_bot.ou.training.self_play import (
+    OUOpponentInfo,
+    OUHistoricalPlayer,
+    OUOpponentPool,
+    OUSelfPlayManager,
+    calculate_elo_update,
+)
+from showdown_bot.ou.training.joint_trainer import (
+    JointTrainer,
+    JointTrainingStats,
+    create_joint_trainer,
+)
+from showdown_bot.ou.training.curriculum import (
+    CurriculumStrategy,
+    CurriculumConfig,
+    CurriculumState,
+    OpponentType,
+    DifficultyLevel,
+    ProgressiveDifficultyCurriculum,
+    MatchupFocusCurriculum,
+    TeamComplexityCurriculum,
+    AdaptiveCurriculum,
+    create_curriculum,
+)
 
 __all__ = [
     "OUTrainingConfig",
@@ -31,4 +55,23 @@ __all__ = [
     "TeamOutcome",
     "OUPlayerTrainer",
     "TeambuilderTrainer",
+    "OUOpponentInfo",
+    "OUHistoricalPlayer",
+    "OUOpponentPool",
+    "OUSelfPlayManager",
+    "calculate_elo_update",
+    "JointTrainer",
+    "JointTrainingStats",
+    "create_joint_trainer",
+    # Curriculum
+    "CurriculumStrategy",
+    "CurriculumConfig",
+    "CurriculumState",
+    "OpponentType",
+    "DifficultyLevel",
+    "ProgressiveDifficultyCurriculum",
+    "MatchupFocusCurriculum",
+    "TeamComplexityCurriculum",
+    "AdaptiveCurriculum",
+    "create_curriculum",
 ]

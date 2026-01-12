@@ -7,19 +7,52 @@ The teambuilder constructs competitive teams using:
 4. Player feedback for optimization
 
 Key components:
-- TeamGenerator: Generates complete teams autoregressively
+- TeamGenerator: Generates complete teams autoregressively (neural + usage-based)
+- UsageBasedGenerator: Generates teams purely from Smogon usage statistics
 - TeamEvaluator: Predicts expected win rate for a team
 - TeamRepresentation: Encodes teams for the neural network
+- PartialTeam/PokemonSlot: Team building data structures
 
 See ../README.md for architecture details.
 """
 
-from showdown_bot.ou.teambuilder.generator import TeamGenerator
-from showdown_bot.ou.teambuilder.evaluator import TeamEvaluator
-from showdown_bot.ou.teambuilder.team_repr import TeamRepresentation
+from showdown_bot.ou.teambuilder.generator import (
+    TeamGenerator,
+    UsageBasedGenerator,
+    normalize_name,
+    format_name,
+    sample_weighted,
+    parse_spread,
+    DEFAULT_SPREADS,
+    DEFAULT_ITEMS,
+    ALL_TYPES,
+    NAME_FORMAT_MAP,
+)
+from showdown_bot.ou.teambuilder.evaluator import TeamEvaluator, TeamTensorEncoder
+from showdown_bot.ou.teambuilder.team_repr import (
+    TeamRepresentation,
+    PartialTeam,
+    PokemonSlot,
+    team_to_showdown_paste,
+    parse_showdown_paste,
+)
 
 __all__ = [
     "TeamGenerator",
+    "UsageBasedGenerator",
     "TeamEvaluator",
+    "TeamTensorEncoder",
     "TeamRepresentation",
+    "PartialTeam",
+    "PokemonSlot",
+    "team_to_showdown_paste",
+    "parse_showdown_paste",
+    "normalize_name",
+    "format_name",
+    "sample_weighted",
+    "parse_spread",
+    "DEFAULT_SPREADS",
+    "DEFAULT_ITEMS",
+    "ALL_TYPES",
+    "NAME_FORMAT_MAP",
 ]

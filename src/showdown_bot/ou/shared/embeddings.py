@@ -40,10 +40,11 @@ class EmbeddingConfig:
     stat_dim: int = 32
 
     # Vocabulary sizes (approximate, will be set from data)
-    num_pokemon: int = 1200  # All Pokemon species
-    num_moves: int = 900  # All moves
-    num_items: int = 250  # All items
-    num_abilities: int = 300  # All abilities
+    # These are set high enough to accommodate all Gen 9 Pokemon forms
+    num_pokemon: int = 2000  # All Pokemon species + forms
+    num_moves: int = 1000  # All moves
+    num_items: int = 500  # All items
+    num_abilities: int = 400  # All abilities
     num_types: int = 18  # Pokemon types
 
 

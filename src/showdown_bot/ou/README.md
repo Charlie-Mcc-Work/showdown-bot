@@ -70,8 +70,13 @@ ou/
 │   └── trainer.py            # Player training loop
 ├── training/                 # Combined training pipelines
 │   ├── __init__.py
-│   ├── joint_trainer.py      # Alternating player/teambuilder training
-│   └── curriculum.py         # Curriculum learning strategies
+│   ├── config.py             # OUTrainingConfig hyperparameters
+│   ├── buffer.py             # OUExperienceBuffer, TeamOutcomeBuffer
+│   ├── player_trainer.py     # OUPlayerTrainer (PPO)
+│   ├── teambuilder_trainer.py # TeambuilderTrainer (evaluator + generator)
+│   ├── self_play.py          # OUSelfPlayManager, OUOpponentPool
+│   ├── joint_trainer.py      # JointTrainer (feedback loop coordinator)
+│   └── curriculum.py         # Curriculum learning strategies (future)
 └── data/                     # Static data and caches
     ├── pokemon_data/         # Pokemon stats, movesets, etc.
     ├── usage_stats/          # Smogon usage statistics
@@ -244,44 +249,177 @@ class JointTrainer:
 
 ## Implementation Phases
 
-### Phase 1: Foundation (Current)
-- [ ] Shared embeddings (Pokemon, moves, items)
-- [ ] OU state encoder
-- [ ] Basic OU player (fixed team)
-- [ ] Sample team loader
+### Phase 1: Foundation - COMPLETE
+- [x] Shared embeddings (Pokemon, moves, items)
+- [x] OU state encoder
+- [x] Basic OU player (fixed team)
+- [x] Sample team loader
 
-### Phase 2: Player Training
-- [ ] Team preview selection
-- [ ] Self-play training loop
+### Phase 2: Player Training - IN PROGRESS
+- [x] Training script (`scripts/train_ou.py`)
+- [x] OURLPlayer / OUNeuralNetworkPlayer integration
+- [x] action_to_battle_order() for 13 actions
+- [x] Experience collection (`OUTrainablePlayer` + PPO updates)
+- [x] Self-play training loop (`OUSelfPlayManager`, `OUOpponentPool`)
+- [x] Team preview selection (heuristic lead selector integrated)
+- [ ] Team preview learning (neural network training - future)
 - [ ] Evaluation vs ladder
 
-### Phase 3: Teambuilder MVP
-- [ ] Team representation
-- [ ] Autoregressive generator
-- [ ] Basic team evaluation
+### Phase 3: Teambuilder MVP - COMPLETE
+- [x] Team representation
+- [x] Autoregressive generator (neural + usage-based)
+- [x] UsageBasedGenerator (generates teams from Smogon usage stats)
+- [x] Basic team evaluation (placeholder network)
+- [x] Teambuilder training loop (infrastructure ready)
+- [x] Full TeamGenerator implementation with:
+  - Species selection weighted by usage rate + teammate correlations
+  - Move selection from common movesets
+  - Item/ability selection from usage data
+  - Nature/EV spreads from common spreads
+  - Proper name formatting (format_name helper)
+- [x] Team → tensor encoding for evaluator (TeamTensorEncoder)
 
-### Phase 4: Joint Training
-- [ ] Player-teambuilder feedback loop
-- [ ] Curriculum strategies
-- [ ] Metagame adaptation
+### Phase 4: Joint Training - COMPLETE
+- [x] Player-teambuilder feedback loop (JointTrainer class)
+- [x] Evaluator training with BCE loss
+- [x] Team performance tracking (TeamOutcomeBuffer)
+- [x] Team rotation based on win rates
+- [x] JointTrainingManager (battle loop integration via poke-env)
+- [x] Joint checkpoint save/load
+- [x] Curriculum learning strategies (progressive, matchup, complexity, adaptive)
+- [ ] Metagame adaptation (future)
 
-## Usage (Planned)
+**Note**: The TeamGenerator now generates fully functional teams using Smogon usage statistics.
+The training script supports three modes:
+- `--mode player`: Train battle decisions (default, fully functional)
+- `--mode teambuilder`: Train team generator (uses usage-based generation)
+- `--mode joint`: Alternating training (player + teambuilder)
+
+## Usage
 
 ```bash
-# Train OU player with sample teams
-python scripts/train_ou.py --mode player --teams data/sample_teams/
+# Train OU player with sample teams (requires Pokemon Showdown server)
+python scripts/train_ou.py                      # Default player mode
+python scripts/train_ou.py -m player            # Explicit player mode
 
-# Train teambuilder with frozen player
-python scripts/train_ou.py --mode teambuilder --player-checkpoint best_player.pt
+# Short training run
+python scripts/train_ou.py -t 100000
 
-# Joint training
-python scripts/train_ou.py --mode joint
+# Resume from checkpoint
+python scripts/train_ou.py --resume
+
+# Use parallel environments
+python scripts/train_ou.py --num-envs 4
+
+# Disable self-play (random/maxdamage opponents only)
+python scripts/train_ou.py --no-self-play
+
+# Monitor with TensorBoard
+tensorboard --logdir runs/ou/
+```
+
+### Generate Teams (Fully Functional)
+```python
+from showdown_bot.ou.teambuilder import UsageBasedGenerator, team_to_showdown_paste
+from showdown_bot.ou.shared.data_loader import UsageStatsLoader
+
+# Load Smogon usage stats
+loader = UsageStatsLoader()
+loader.load(tier="gen9ou", rating=1695)
 
 # Generate a team
-python scripts/generate_team.py --checkpoint teambuilder.pt --style balanced
+gen = UsageBasedGenerator(usage_loader=loader)
+team = gen.generate_team(temperature=1.0)  # Higher temp = more random
 
-# Play on ladder
-python scripts/play_ou.py --player-checkpoint player.pt --team-checkpoint teambuilder.pt
+# Convert to Showdown paste format
+full_team = team.to_team()
+paste = team_to_showdown_paste(full_team)
+print(paste)
+```
+
+### Teambuilder Training
+```bash
+# Train teambuilder with frozen player
+python scripts/train_ou.py --mode teambuilder --player-checkpoint data/checkpoints/ou/best_model.pt
+
+# Teambuilder with custom settings
+python scripts/train_ou.py -m teambuilder --total-teams 500 --games-per-team 5
+```
+
+### Joint Training (Fully Functional)
+Joint training coordinates player and teambuilder with a feedback loop:
+1. Teams are drawn from an active pool (initially sample teams + generated teams)
+2. Player battles with these teams against random/maxdamage opponents
+3. Battle outcomes train both:
+   - Player: PPO updates on battle experiences
+   - Teambuilder: Evaluator learns to predict win rates (BCE loss)
+4. Worst-performing teams are rotated out and replaced with newly generated ones
+5. TensorBoard logs track player win rate, skill rating, and best team performance
+
+```bash
+# Joint player + teambuilder training
+python scripts/train_ou.py --mode joint
+
+# With parallel environments
+python scripts/train_ou.py --mode joint --num-envs 4
+
+# Resume from checkpoint
+python scripts/train_ou.py --mode joint --resume
+
+# Monitor with TensorBoard
+tensorboard --logdir runs/ou/joint/
+```
+
+Checkpoints are saved to `data/checkpoints/ou/joint/`:
+- `player.pt`: Player network checkpoint
+- `teambuilder.pt`: Generator + evaluator checkpoint
+- `joint_state.pt`: Training statistics
+
+### Curriculum Learning
+Curriculum learning progressively increases training difficulty based on agent performance:
+
+```bash
+# Use adaptive curriculum (default, combines all strategies)
+python scripts/train_ou.py --mode joint --curriculum adaptive
+
+# Progressive difficulty only (random → maxdamage → self-play)
+python scripts/train_ou.py --mode joint --curriculum progressive
+
+# Matchup focus (targets weak opponent types)
+python scripts/train_ou.py --mode joint --curriculum matchup
+
+# Team complexity (starts with sample teams, adds generated)
+python scripts/train_ou.py --mode joint --curriculum complexity
+
+# Disable curriculum (random opponent selection)
+python scripts/train_ou.py --mode joint --curriculum none
+```
+
+**Available strategies:**
+- **`adaptive`**: Combines all strategies based on training phase (recommended)
+- **`progressive`**: 5 difficulty levels from BEGINNER (random only) to EXPERT (strong self-play)
+- **`matchup`**: Tracks win rates per opponent type, focuses on weaknesses
+- **`complexity`**: Gradually introduces generated teams vs sample teams
+
+**Difficulty progression:**
+| Level | Opponent Mix |
+|-------|-------------|
+| BEGINNER | 100% Random |
+| EASY | 70% Random, 30% MaxDamage |
+| MEDIUM | 50% MaxDamage, 50% Weak Self-Play |
+| HARD | Mixed Self-Play |
+| EXPERT | Strong Self-Play |
+
+Promotion requires 65%+ win rate over 50 battles. Demotion occurs at <35% win rate.
+Curriculum state is saved in checkpoints and restored on resume.
+
+### Planned Commands (Not Yet Implemented)
+```bash
+# Generate a team from CLI
+python scripts/generate_team.py --style balanced
+
+# Play on ladder with generated teams
+python scripts/play_ou.py --player-checkpoint player.pt
 ```
 
 ## References
