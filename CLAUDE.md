@@ -6,23 +6,33 @@ A reinforcement learning bot that plays Pokemon Showdown Gen 9 Random Battles us
 
 **IMPORTANT**: After completing each task, always tell the user what the next task is.
 
-Current task queue:
+### Current Status: OU Joint Training System COMPLETE
+
+All core OU training infrastructure is now fully implemented:
+- ✅ Player training with PPO
+- ✅ Teambuilder with usage-based generation
+- ✅ Joint training with feedback loop
+- ✅ Curriculum learning (4 strategies)
+- ✅ Self-play opponent pool
+- ✅ TensorBoard logging
+
+### Completed Tasks
 1. ~~Hyperparameter tuning~~ (complete)
 2. ~~Parallel environments~~ (complete - tested 4 envs at ~360 it/s)
 3. ~~Websocket error fix~~ (complete - auto-retry with reconnection)
 4. ~~Browser coaching extension~~ (COMPLETE)
-5. ~~OU Module Foundation~~ (complete - player classes, training script)
+5. ~~OU Module Foundation~~ (COMPLETE)
 6. ~~OU Experience Collection~~ (COMPLETE)
 7. ~~OU Self-Play System~~ (COMPLETE)
-8. ~~OU Team Preview Integration~~ (COMPLETE - heuristic selector)
-9. ~~OU Teambuilder Training Loop~~ (COMPLETE - infrastructure ready)
-10. ~~OU Joint Training~~ (COMPLETE - placeholder, awaits TeamGenerator)
+8. ~~OU Team Preview Integration~~ (COMPLETE)
+9. ~~OU Teambuilder Training Loop~~ (COMPLETE)
+10. ~~OU Joint Training~~ (COMPLETE)
+11. ~~Curriculum Learning~~ (COMPLETE - 4 strategies: adaptive, progressive, matchup, complexity)
 
-**Next steps** for OU completion:
-- Implement full TeamGenerator (species selection, move selection, etc.)
-- Implement Team → tensor encoding for TeamEvaluator
-- Extended training runs with player mode
-- Evaluation against Showdown ladder
+### Next Steps (Ready to Execute)
+1. **Extended training runs** - Run joint training for extended periods to improve player/teambuilder
+2. **Ladder evaluation** - Test trained model against Showdown ladder
+3. **Metagame adaptation** - Periodic usage stats updates during training
 
 ### OU Development Plan
 
@@ -222,7 +232,7 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 - [x] Comprehensive test suite
 - [x] Self-play integrated into trainer
 - [x] Parallel environment support (moved to Phase 4, now complete)
-- [ ] Curriculum learning (Future)
+- [x] Curriculum learning (implemented in OU module, 4 strategies)
 
 #### Phase 4: Training & Optimization - IN PROGRESS
 - [x] Hyperparameter tuning system (Optuna)
@@ -243,7 +253,7 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 - [x] Model inference server (Flask API)
 - [ ] Screen capture integration (future)
 
-#### Phase 7: OU Expansion - TEAM GENERATION COMPLETE
+#### Phase 7: OU Expansion - COMPLETE
 - [x] Module architecture design (see `src/showdown_bot/ou/README.md`)
 - [x] Shared embeddings (Pokemon, moves, items, abilities)
 - [x] Team representation and serialization
@@ -253,7 +263,7 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
   - [x] Move/item/ability selection from common sets
   - [x] Nature/EV spreads from usage data
   - [x] Proper name formatting (format_name helper)
-- [x] Team evaluator network (placeholder architecture)
+- [x] Team evaluator network (TeamTensorEncoder for encoding)
 - [x] OU state encoder with opponent prediction
 - [x] Team preview lead selector (heuristic)
 - [x] OURLPlayer / OUNeuralNetworkPlayer (poke-env integration)
@@ -262,8 +272,14 @@ Chrome extension that coaches you on play.pokemonshowdown.com:
 - [x] Self-play for OU (OUSelfPlayManager, OUOpponentPool)
 - [x] Teambuilder training loop infrastructure
 - [x] Usage stats integration (UsageStatsLoader downloads from Smogon)
-- [ ] Team → tensor encoding for evaluator
-- [ ] Metagame analysis
+- [x] JointTrainer with player-teambuilder feedback loop
+- [x] JointTrainingManager (battle loop integration)
+- [x] **Curriculum learning strategies**:
+  - [x] ProgressiveDifficultyCurriculum (5 levels: BEGINNER→EXPERT)
+  - [x] MatchupFocusCurriculum (targets weak opponent types)
+  - [x] TeamComplexityCurriculum (sample→generated teams)
+  - [x] AdaptiveCurriculum (combines all based on phase)
+- [ ] Metagame adaptation (future - periodic usage stats refresh)
 
 ---
 
@@ -366,22 +382,48 @@ tensorboard --logdir runs/
 ```
 
 ### Running OU Training
+
+**Prerequisites**: Pokemon Showdown server must be running:
 ```bash
-# Train OU player with sample teams
-python scripts/train_ou.py
-
-# Short training run
-python scripts/train_ou.py -t 100000
-
-# Resume from checkpoint
-python scripts/train_ou.py --resume
-
-# Use parallel environments
-python scripts/train_ou.py --num-envs 4
-
-# Monitor with TensorBoard
-tensorboard --logdir runs/ou/
+cd ~/pokemon-showdown && node pokemon-showdown start --no-security
 ```
+
+**Three training modes available:**
+
+```bash
+# 1. PLAYER MODE (default) - Train battle decisions with sample teams
+python scripts/train_ou.py                      # Default
+python scripts/train_ou.py --mode player        # Explicit
+
+# 2. TEAMBUILDER MODE - Train team generator (requires frozen player)
+python scripts/train_ou.py --mode teambuilder --player-checkpoint data/checkpoints/ou/best_model.pt
+
+# 3. JOINT MODE (RECOMMENDED) - Train both together with feedback loop
+python scripts/train_ou.py --mode joint
+python scripts/train_ou.py --mode joint --num-envs 4              # Faster with parallel envs
+python scripts/train_ou.py --mode joint --curriculum adaptive     # With curriculum (default)
+python scripts/train_ou.py --mode joint --curriculum progressive  # Progressive difficulty only
+```
+
+**Curriculum strategies** (joint mode only):
+- `adaptive` (default): Combines all strategies based on training phase
+- `progressive`: 5 difficulty levels (BEGINNER→EXPERT)
+- `matchup`: Focuses on opponent types with low win rates
+- `complexity`: Starts simple teams, adds generated ones
+- `none`: Disabled (random opponent selection)
+
+**Common options:**
+```bash
+python scripts/train_ou.py -t 100000           # Short training (100k steps)
+python scripts/train_ou.py --resume            # Resume from checkpoint
+python scripts/train_ou.py --no-self-play      # Random/maxdamage only
+tensorboard --logdir runs/ou/                  # Monitor training
+```
+
+**Checkpoints saved to:**
+- Player mode: `data/checkpoints/ou/`
+- Teambuilder mode: `data/checkpoints/ou/teambuilder/`
+- Joint mode: `data/checkpoints/ou/joint/` (player.pt, teambuilder.pt, joint_state.pt)
 
 ### Evaluation
 ```bash

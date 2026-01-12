@@ -11,6 +11,72 @@ Unlike Random Battles where teams are assigned, OU requires:
 
 This module uses a **hybrid approach** where the player and teambuilder are trained separately but connected through shared representations and feedback loops.
 
+---
+
+## Quick Start
+
+### Prerequisites
+```bash
+# 1. Start Pokemon Showdown server (required for all training)
+cd ~/pokemon-showdown && node pokemon-showdown start --no-security
+```
+
+### Training Commands
+
+**Joint Training (RECOMMENDED)** - Trains player and teambuilder together:
+```bash
+# Basic joint training
+python scripts/train_ou.py --mode joint
+
+# With parallel environments (faster)
+python scripts/train_ou.py --mode joint --num-envs 4
+
+# With specific curriculum strategy
+python scripts/train_ou.py --mode joint --curriculum adaptive   # Default, recommended
+python scripts/train_ou.py --mode joint --curriculum progressive
+python scripts/train_ou.py --mode joint --curriculum matchup
+python scripts/train_ou.py --mode joint --curriculum complexity
+
+# Resume from checkpoint
+python scripts/train_ou.py --mode joint --resume
+
+# Monitor with TensorBoard
+tensorboard --logdir runs/ou/joint/
+```
+
+**Player-Only Training** - Train battle decisions with fixed sample teams:
+```bash
+python scripts/train_ou.py --mode player          # or just: python scripts/train_ou.py
+python scripts/train_ou.py --mode player --num-envs 4
+```
+
+**Teambuilder-Only Training** - Train team generation (requires trained player):
+```bash
+python scripts/train_ou.py --mode teambuilder --player-checkpoint data/checkpoints/ou/best_model.pt
+```
+
+### Generate Teams Programmatically
+```python
+from showdown_bot.ou.teambuilder import UsageBasedGenerator, team_to_showdown_paste
+from showdown_bot.ou.shared.data_loader import UsageStatsLoader
+
+loader = UsageStatsLoader()
+loader.load(tier="gen9ou", rating=1695)
+
+gen = UsageBasedGenerator(usage_loader=loader)
+team = gen.generate_team(temperature=1.0)
+print(team_to_showdown_paste(team.to_team()))
+```
+
+### Checkpoint Locations
+| Mode | Location |
+|------|----------|
+| Player | `data/checkpoints/ou/` |
+| Teambuilder | `data/checkpoints/ou/teambuilder/` |
+| Joint | `data/checkpoints/ou/joint/` (player.pt, teambuilder.pt, joint_state.pt) |
+
+---
+
 ## Architecture
 
 ```
@@ -76,7 +142,7 @@ ou/
 │   ├── teambuilder_trainer.py # TeambuilderTrainer (evaluator + generator)
 │   ├── self_play.py          # OUSelfPlayManager, OUOpponentPool
 │   ├── joint_trainer.py      # JointTrainer (feedback loop coordinator)
-│   └── curriculum.py         # Curriculum learning strategies (future)
+│   └── curriculum.py         # Curriculum learning (4 strategies)
 └── data/                     # Static data and caches
     ├── pokemon_data/         # Pokemon stats, movesets, etc.
     ├── usage_stats/          # Smogon usage statistics
@@ -249,13 +315,13 @@ class JointTrainer:
 
 ## Implementation Phases
 
-### Phase 1: Foundation - COMPLETE
+### Phase 1: Foundation - COMPLETE ✅
 - [x] Shared embeddings (Pokemon, moves, items)
 - [x] OU state encoder
 - [x] Basic OU player (fixed team)
 - [x] Sample team loader
 
-### Phase 2: Player Training - IN PROGRESS
+### Phase 2: Player Training - COMPLETE ✅
 - [x] Training script (`scripts/train_ou.py`)
 - [x] OURLPlayer / OUNeuralNetworkPlayer integration
 - [x] action_to_battle_order() for 13 actions
@@ -263,9 +329,9 @@ class JointTrainer:
 - [x] Self-play training loop (`OUSelfPlayManager`, `OUOpponentPool`)
 - [x] Team preview selection (heuristic lead selector integrated)
 - [ ] Team preview learning (neural network training - future)
-- [ ] Evaluation vs ladder
+- [ ] Evaluation vs ladder (future)
 
-### Phase 3: Teambuilder MVP - COMPLETE
+### Phase 3: Teambuilder MVP - COMPLETE ✅
 - [x] Team representation
 - [x] Autoregressive generator (neural + usage-based)
 - [x] UsageBasedGenerator (generates teams from Smogon usage stats)
@@ -279,15 +345,19 @@ class JointTrainer:
   - Proper name formatting (format_name helper)
 - [x] Team → tensor encoding for evaluator (TeamTensorEncoder)
 
-### Phase 4: Joint Training - COMPLETE
+### Phase 4: Joint Training - COMPLETE ✅
 - [x] Player-teambuilder feedback loop (JointTrainer class)
 - [x] Evaluator training with BCE loss
 - [x] Team performance tracking (TeamOutcomeBuffer)
 - [x] Team rotation based on win rates
 - [x] JointTrainingManager (battle loop integration via poke-env)
 - [x] Joint checkpoint save/load
-- [x] Curriculum learning strategies (progressive, matchup, complexity, adaptive)
-- [ ] Metagame adaptation (future)
+- [x] Curriculum learning strategies:
+  - `adaptive` - Combines all strategies based on training phase (recommended)
+  - `progressive` - 5 difficulty levels (BEGINNER→EXPERT)
+  - `matchup` - Focuses training on opponent types with low win rates
+  - `complexity` - Starts with sample teams, gradually introduces generated
+- [ ] Metagame adaptation (future - periodic usage stats refresh)
 
 **Note**: The TeamGenerator now generates fully functional teams using Smogon usage statistics.
 The training script supports three modes:
