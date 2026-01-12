@@ -67,8 +67,13 @@ class HistoricalPlayer(Player):
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Choose a move using the loaded model."""
         # Handle cleanup race condition - model may be deleted while websocket
-        # still has pending messages
+        # still has pending messages. This should be rare - log if it happens.
         if not hasattr(self, 'model') or self.model is None:
+            import logging
+            logging.getLogger(__name__).warning(
+                f"HistoricalPlayer model is None during choose_move (battle turn {battle.turn}) "
+                "- using random move. If this happens often, increase cleanup delay."
+            )
             return self.choose_random_move(battle)
 
         state = self.state_encoder.encode_battle(battle)
