@@ -12,6 +12,9 @@ class RolloutBuffer:
 
     Stores transitions from multiple parallel environments and computes
     advantages using Generalized Advantage Estimation (GAE).
+
+    Episode boundaries are tracked so that GAE is computed correctly
+    even when experiences from different environments are interleaved.
     """
 
     buffer_size: int
@@ -38,6 +41,9 @@ class RolloutBuffer:
     ptr: int = field(init=False, default=0)
     path_start_idx: int = field(init=False, default=0)
     full: bool = field(init=False, default=False)
+
+    # Episode boundary tracking for correct GAE computation
+    episode_ends: list = field(init=False, default_factory=list)
 
     def __post_init__(self) -> None:
         """Initialize storage arrays."""
@@ -93,7 +99,10 @@ class RolloutBuffer:
         done: bool | np.ndarray,
         value: float | np.ndarray,
     ) -> None:
-        """Add a transition to the buffer."""
+        """Add a transition to the buffer.
+
+        Tracks episode boundaries when done=True for correct GAE computation.
+        """
         self.player_pokemon[self.ptr] = player_pokemon
         self.opponent_pokemon[self.ptr] = opponent_pokemon
         self.player_active_idx[self.ptr] = player_active_idx
@@ -106,6 +115,11 @@ class RolloutBuffer:
         self.dones[self.ptr] = done
         self.values[self.ptr] = value
 
+        # Track episode boundaries - done flag marks end of episode
+        done_val = done[0] if isinstance(done, np.ndarray) else done
+        if done_val:
+            self.episode_ends.append(self.ptr)
+
         self.ptr += 1
         if self.ptr >= self.buffer_size:
             self.full = True
@@ -113,27 +127,78 @@ class RolloutBuffer:
     def compute_advantages(self, last_value: np.ndarray, last_done: np.ndarray) -> None:
         """Compute GAE advantages and returns.
 
+        Processes each episode separately to avoid bleeding advantages across
+        episode boundaries when experiences from multiple environments are
+        interleaved in the buffer.
+
         Args:
             last_value: Value estimate for the state after the last stored transition
             last_done: Whether the last state was terminal
         """
-        last_gae = 0
-        for t in reversed(range(self.ptr)):
-            if t == self.ptr - 1:
-                next_non_terminal = 1.0 - last_done
-                next_value = last_value
-            else:
-                next_non_terminal = 1.0 - self.dones[t + 1]
-                next_value = self.values[t + 1]
+        if self.ptr == 0:
+            return
 
-            delta = (
-                self.rewards[t]
-                + self.gamma * next_value * next_non_terminal
-                - self.values[t]
-            )
-            self.advantages[t] = last_gae = (
-                delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
-            )
+        # Build episode segments: [(start, end), ...]
+        # Each segment is a contiguous episode that ends with done=True
+        # or is an incomplete episode at the end of the buffer
+        segments = []
+        start = 0
+        for end_idx in self.episode_ends:
+            # end_idx is the index where done=True was stored (before ptr increment)
+            # So the episode is [start, end_idx] inclusive
+            segments.append((start, end_idx + 1))  # +1 to make it exclusive end
+            start = end_idx + 1
+
+        # Add final segment if there's data after the last episode end
+        if start < self.ptr:
+            segments.append((start, self.ptr))
+
+        # If no segments were created (no episode_ends), treat entire buffer as one segment
+        if not segments:
+            segments = [(0, self.ptr)]
+
+        # Process each segment independently
+        for seg_start, seg_end in segments:
+            # Check if the last step of this segment has done=True
+            last_step = seg_end - 1
+            segment_is_terminal = bool(self.dones[last_step, 0] > 0.5)
+
+            # Bootstrap value for this segment
+            if segment_is_terminal:
+                # Episode ended with done=True - bootstrap from 0
+                segment_last_value = np.zeros((1,), dtype=np.float32)
+                segment_last_done = np.ones((1,), dtype=np.float32)
+            elif seg_end == self.ptr:
+                # Final incomplete segment - episode still ongoing
+                # Use provided last_value for bootstrapping, but mark as non-terminal
+                # so we properly bootstrap from value instead of 0
+                segment_last_value = last_value
+                # Force non-terminal since the episode didn't actually end
+                segment_last_done = np.zeros((1,), dtype=np.float32)
+            else:
+                # Middle incomplete segment (shouldn't happen with current logic)
+                # but handle defensively - treat as non-terminal
+                segment_last_value = np.zeros((1,), dtype=np.float32)
+                segment_last_done = np.zeros((1,), dtype=np.float32)
+
+            # Compute GAE for this segment
+            last_gae = 0.0
+            for t in reversed(range(seg_start, seg_end)):
+                if t == seg_end - 1:
+                    next_non_terminal = 1.0 - segment_last_done
+                    next_value = segment_last_value
+                else:
+                    next_non_terminal = 1.0 - self.dones[t + 1]
+                    next_value = self.values[t + 1]
+
+                delta = (
+                    self.rewards[t]
+                    + self.gamma * next_value * next_non_terminal
+                    - self.values[t]
+                )
+                self.advantages[t] = last_gae = (
+                    delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae
+                )
 
         self.returns[:self.ptr] = self.advantages[:self.ptr] + self.values[:self.ptr]
 
@@ -230,6 +295,7 @@ class RolloutBuffer:
         self.ptr = 0
         self.path_start_idx = 0
         self.full = False
+        self.episode_ends = []
 
     @property
     def size(self) -> int:

@@ -26,8 +26,35 @@ class TrainingConfig(BaseSettings):
     opponent_pool_size: int = Field(default=10, description="Number of past checkpoints to keep")
     checkpoint_interval: int = Field(default=50_000, description="Steps between checkpoints")
     self_play_ratio: float = Field(
-        default=0.8, description="Fraction of games against self vs random"
+        default=0.8, description="Fraction of games against self vs random (used if curriculum disabled)"
     )
+
+    # Curriculum opponent selection - adjusts opponent mix based on skill
+    curriculum_enabled: bool = Field(
+        default=True, description="Enable curriculum-based opponent selection"
+    )
+    # Skill thresholds for curriculum stages
+    curriculum_skill_min: float = Field(
+        default=1000.0, description="Skill level where curriculum starts (early stage)"
+    )
+    curriculum_skill_max: float = Field(
+        default=5000.0, description="Skill level where curriculum ends (late stage)"
+    )
+    # Early stage ratios (when skill <= curriculum_skill_min)
+    curriculum_early_self_play: float = Field(
+        default=0.3, description="Self-play ratio in early training"
+    )
+    curriculum_early_max_damage: float = Field(
+        default=0.4, description="MaxDamage ratio in early training"
+    )
+    # Late stage ratios (when skill >= curriculum_skill_max)
+    curriculum_late_self_play: float = Field(
+        default=0.8, description="Self-play ratio in late training"
+    )
+    curriculum_late_max_damage: float = Field(
+        default=0.15, description="MaxDamage ratio in late training"
+    )
+    # Random ratio = 1 - self_play - max_damage
 
     # Environment
     num_envs: int = Field(default=8, description="Number of parallel environments")

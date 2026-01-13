@@ -366,7 +366,7 @@ def calculate_elo_update(
 
 
 class SelfPlayManager:
-    """Manages self-play training with opponent pool."""
+    """Manages self-play training with opponent pool and curriculum learning."""
 
     def __init__(
         self,
@@ -376,22 +376,46 @@ class SelfPlayManager:
         checkpoint_interval: int = 50000,
         sampling_strategy: str = "skill_matched",
         device: torch.device | None = None,
+        # Curriculum parameters
+        curriculum_enabled: bool = True,
+        curriculum_skill_min: float = 1000.0,
+        curriculum_skill_max: float = 5000.0,
+        curriculum_early_self_play: float = 0.3,
+        curriculum_early_max_damage: float = 0.4,
+        curriculum_late_self_play: float = 0.8,
+        curriculum_late_max_damage: float = 0.15,
     ):
         """Initialize self-play manager.
 
         Args:
             pool_dir: Directory for opponent checkpoints
             max_pool_size: Maximum opponents in pool
-            self_play_ratio: Fraction of games against self-play opponents
+            self_play_ratio: Fraction of games against self-play opponents (if curriculum disabled)
             checkpoint_interval: Timesteps between adding to pool
             sampling_strategy: How to sample opponents
             device: Device for models
+            curriculum_enabled: Whether to use curriculum-based opponent selection
+            curriculum_skill_min: Skill level at start of curriculum
+            curriculum_skill_max: Skill level at end of curriculum
+            curriculum_early_self_play: Self-play ratio at early stage
+            curriculum_early_max_damage: MaxDamage ratio at early stage
+            curriculum_late_self_play: Self-play ratio at late stage
+            curriculum_late_max_damage: MaxDamage ratio at late stage
         """
         self.pool_dir = Path(pool_dir)
         self.self_play_ratio = self_play_ratio
         self.checkpoint_interval = checkpoint_interval
         self.sampling_strategy = sampling_strategy
         self.device = device or torch.device("cpu")
+
+        # Curriculum settings
+        self.curriculum_enabled = curriculum_enabled
+        self.curriculum_skill_min = curriculum_skill_min
+        self.curriculum_skill_max = curriculum_skill_max
+        self.curriculum_early_self_play = curriculum_early_self_play
+        self.curriculum_early_max_damage = curriculum_early_max_damage
+        self.curriculum_late_self_play = curriculum_late_self_play
+        self.curriculum_late_max_damage = curriculum_late_max_damage
 
         self.opponent_pool = OpponentPool(
             pool_dir=self.pool_dir,
@@ -403,13 +427,67 @@ class SelfPlayManager:
         # Initialize to negative interval so first checkpoint triggers at timestep 0
         self.last_checkpoint_timestep = -checkpoint_interval
         self.games_vs_self_play = 0
+        self.games_vs_max_damage = 0
         self.games_vs_random = 0
 
-    def should_use_self_play(self) -> bool:
-        """Decide whether to use self-play or random opponent."""
+    def get_curriculum_ratios(self) -> tuple[float, float, float]:
+        """Get current opponent ratios based on skill level.
+
+        Returns:
+            Tuple of (self_play_ratio, max_damage_ratio, random_ratio)
+        """
+        if not self.curriculum_enabled:
+            # Use fixed ratio when curriculum is disabled
+            return self.self_play_ratio, 0.0, 1.0 - self.self_play_ratio
+
+        # Calculate progress through curriculum (0 to 1)
+        skill_range = self.curriculum_skill_max - self.curriculum_skill_min
+        if skill_range <= 0:
+            progress = 1.0
+        else:
+            progress = (self.agent_skill - self.curriculum_skill_min) / skill_range
+            progress = max(0.0, min(1.0, progress))  # Clamp to [0, 1]
+
+        # Linear interpolation between early and late ratios
+        self_play = (
+            self.curriculum_early_self_play
+            + progress * (self.curriculum_late_self_play - self.curriculum_early_self_play)
+        )
+        max_damage = (
+            self.curriculum_early_max_damage
+            + progress * (self.curriculum_late_max_damage - self.curriculum_early_max_damage)
+        )
+        random_ratio = 1.0 - self_play - max_damage
+
+        return self_play, max_damage, random_ratio
+
+    def select_opponent_type(self) -> str:
+        """Select which type of opponent to use based on curriculum.
+
+        Returns:
+            One of: "self_play", "max_damage", "random"
+        """
+        self_play_ratio, max_damage_ratio, _ = self.get_curriculum_ratios()
+
+        # If no self-play opponents available, redistribute to others
         if self.opponent_pool.size == 0:
-            return False
-        return random.random() < self.self_play_ratio
+            # Can't do self-play, split between max_damage and random
+            total = max_damage_ratio + (1.0 - self_play_ratio - max_damage_ratio)
+            if total > 0:
+                adjusted_max_damage = max_damage_ratio / total
+            else:
+                adjusted_max_damage = 0.5
+            if random.random() < adjusted_max_damage:
+                return "max_damage"
+            return "random"
+
+        roll = random.random()
+        if roll < self_play_ratio:
+            return "self_play"
+        elif roll < self_play_ratio + max_damage_ratio:
+            return "max_damage"
+        else:
+            return "random"
 
     def should_add_checkpoint(self, current_timestep: int) -> bool:
         """Check if it's time to add a new checkpoint to the pool."""
@@ -436,18 +514,21 @@ class SelfPlayManager:
         battle_format: str,
         server_configuration: ServerConfiguration | None = None,
     ) -> tuple[Player, OpponentInfo | None]:
-        """Get an opponent to play against.
+        """Get an opponent to play against using curriculum-based selection.
 
         Args:
             battle_format: Pokemon Showdown battle format
             server_configuration: Server to connect to (None for default)
 
         Returns:
-            Tuple of (opponent_player, opponent_info or None for random)
+            Tuple of (opponent_player, opponent_info or None for non-self-play)
         """
         from poke_env.player import RandomPlayer
+        from showdown_bot.environment.battle_env import MaxDamagePlayer
 
-        if self.should_use_self_play():
+        opponent_type = self.select_opponent_type()
+
+        if opponent_type == "self_play":
             opponent_info = self.opponent_pool.sample_opponent(
                 strategy=self.sampling_strategy,
                 current_skill=self.agent_skill,
@@ -458,8 +539,18 @@ class SelfPlayManager:
                 )
                 self.games_vs_self_play += 1
                 return player, opponent_info
+            # Fallback if sampling failed
+            opponent_type = "max_damage"
 
-        # Fallback to random
+        if opponent_type == "max_damage":
+            self.games_vs_max_damage += 1
+            return MaxDamagePlayer(
+                battle_format=battle_format,
+                max_concurrent_battles=1,
+                server_configuration=server_configuration,
+            ), None
+
+        # Random
         self.games_vs_random += 1
         return RandomPlayer(
             battle_format=battle_format,
@@ -485,14 +576,23 @@ class SelfPlayManager:
 
     def get_stats(self) -> dict[str, Any]:
         """Get self-play statistics."""
-        total_games = self.games_vs_self_play + self.games_vs_random
+        total_games = self.games_vs_self_play + self.games_vs_max_damage + self.games_vs_random
+        self_play_ratio, max_damage_ratio, random_ratio = self.get_curriculum_ratios()
         return {
             "agent_skill": self.agent_skill,
             "pool_size": self.opponent_pool.size,
             "pool_avg_skill": self.opponent_pool.average_skill,
             "games_vs_self_play": self.games_vs_self_play,
+            "games_vs_max_damage": self.games_vs_max_damage,
             "games_vs_random": self.games_vs_random,
             "self_play_ratio_actual": (
                 self.games_vs_self_play / total_games if total_games > 0 else 0.0
             ),
+            "max_damage_ratio_actual": (
+                self.games_vs_max_damage / total_games if total_games > 0 else 0.0
+            ),
+            # Current curriculum ratios (what the scheduler is targeting)
+            "curriculum_self_play_target": self_play_ratio,
+            "curriculum_max_damage_target": max_damage_ratio,
+            "curriculum_random_target": random_ratio,
         }

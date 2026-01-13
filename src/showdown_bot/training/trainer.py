@@ -465,7 +465,7 @@ class Trainer:
             device=device,
         )
 
-        # Self-play manager
+        # Self-play manager with curriculum opponent selection
         self.self_play_manager = SelfPlayManager(
             pool_dir=self_play_dir,
             max_pool_size=20,
@@ -473,6 +473,14 @@ class Trainer:
             checkpoint_interval=self.config.checkpoint_interval,
             sampling_strategy="skill_matched",
             device=device,
+            # Curriculum settings
+            curriculum_enabled=self.config.curriculum_enabled,
+            curriculum_skill_min=self.config.curriculum_skill_min,
+            curriculum_skill_max=self.config.curriculum_skill_max,
+            curriculum_early_self_play=self.config.curriculum_early_self_play,
+            curriculum_early_max_damage=self.config.curriculum_early_max_damage,
+            curriculum_late_self_play=self.config.curriculum_late_self_play,
+            curriculum_late_max_damage=self.config.curriculum_late_max_damage,
         ) if use_self_play else None
 
         # TensorBoard writer - will be set on train start
@@ -1017,19 +1025,29 @@ class Trainer:
                     "avg_length": float(np.mean(all_lengths)) if all_lengths else 0.0,
                 }
 
-                # Update self-play stats (use aggregate win rate)
+                # Update self-play stats per-environment (not aggregate)
+                # Each player tracks its own wins/losses against its opponent
                 if self.self_play_manager:
-                    for info in opponent_infos:
-                        if info is not None:
-                            won = rollout_stats["win_rate"] > 0.5
-                            self.self_play_manager.update_after_game(info, won)
+                    for i, info in enumerate(opponent_infos):
+                        if info is not None and i < len(players):
+                            player = players[i]
+                            # Use this player's individual win rate against this opponent
+                            if player._rollout_battles > 0:
+                                player_won = player._rollout_wins > player._rollout_battles / 2
+                                self.self_play_manager.update_after_game(info, player_won)
 
                 # Add to buffer
                 total_added = self.add_experiences_to_buffer_parallel(all_env_experiences)
 
-                # Compute advantages (buffer uses num_envs=1)
-                last_value = np.zeros((1,), dtype=np.float32)
-                last_done = np.ones((1,), dtype=np.float32)
+                # Compute advantages
+                # For incomplete episodes, use the average value from the buffer as bootstrap
+                # This is better than 0 for episodes that haven't terminated yet
+                if self.buffer.ptr > 0:
+                    last_value = np.array([self.buffer.values[:self.buffer.ptr].mean()], dtype=np.float32)
+                else:
+                    last_value = np.zeros((1,), dtype=np.float32)
+                # last_done is ignored by the buffer now - it checks actual done flags
+                last_done = np.zeros((1,), dtype=np.float32)
                 self.buffer.compute_advantages(last_value, last_done)
 
                 # PPO update
