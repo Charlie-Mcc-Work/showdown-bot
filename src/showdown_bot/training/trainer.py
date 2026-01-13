@@ -14,11 +14,12 @@ from typing import Any
 
 import numpy as np
 import torch
+from torch.amp import autocast
 from poke_env.player import Player, RandomPlayer
+from poke_env.ps_client import ServerConfiguration
 from poke_env.player.battle_order import BattleOrder
 from poke_env.battle import AbstractBattle
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError
 
 from showdown_bot.config import training_config, TrainingConfig
@@ -118,6 +119,132 @@ class MemoryMonitor:
         return f"{self.format_memory(used)}/{self.format_memory(total)} ({percent:.1f}%)"
 
 
+class TrainingDisplay:
+    """Training display that updates in place using ANSI escape codes."""
+
+    def __init__(self, total_timesteps: int, start_timesteps: int = 0):
+        self.total_timesteps = total_timesteps
+        self.start_timesteps = start_timesteps
+        self.current_timesteps = start_timesteps
+        self.start_time = time.time()
+        self.last_update_time = self.start_time
+        self.last_timesteps = start_timesteps
+        self.iteration = 0
+
+        # Smoothed speed calculation
+        self._speed_history: list[float] = []
+        self._speed_window = 10
+
+        # Track if we're in the middle of an in-place update
+        self._in_place_active = False
+
+    def _format_number(self, n: int) -> str:
+        """Format large numbers with K/M suffix."""
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.2f}M"
+        elif n >= 1_000:
+            return f"{n / 1_000:.1f}K"
+        return str(n)
+
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as human-readable time."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            return f"{seconds / 60:.0f}m"
+        else:
+            hours = int(seconds // 3600)
+            mins = int((seconds % 3600) // 60)
+            return f"{hours}h{mins}m"
+
+    def _get_speed(self) -> float:
+        """Get smoothed iterations per second."""
+        if not self._speed_history:
+            return 0.0
+        return sum(self._speed_history) / len(self._speed_history)
+
+    def initialize(self):
+        """Print header (static, not updated in place)."""
+        pass  # Header will be part of the update line
+
+    def close(self):
+        """Move to new line after in-place updates."""
+        if self._in_place_active:
+            print()  # Move past the in-place line
+            self._in_place_active = False
+
+    def update(
+        self,
+        timesteps: int,
+        rollout_stats: dict | None = None,
+        ppo_stats: "PPOStats | None" = None,
+        skill: float | None = None,
+        pool_size: int | None = None,
+        memory_str: str = "",
+        memory_percent: float = 0.0,
+        best_skill: float = 0.0,
+    ):
+        """Update the display in place."""
+        now = time.time()
+        self.current_timesteps = timesteps
+        self.iteration += 1
+
+        # Calculate speed
+        time_delta = now - self.last_update_time
+        if time_delta > 0:
+            step_delta = timesteps - self.last_timesteps
+            instant_speed = step_delta / time_delta
+            self._speed_history.append(instant_speed)
+            if len(self._speed_history) > self._speed_window:
+                self._speed_history.pop(0)
+
+        self.last_update_time = now
+        self.last_timesteps = timesteps
+
+        # Calculate progress and ETA
+        speed = self._get_speed()
+        steps_done = timesteps - self.start_timesteps
+        steps_total = self.total_timesteps - self.start_timesteps
+        progress = steps_done / steps_total if steps_total > 0 else 0.0
+
+        # ETA calculation
+        if speed > 0 and progress < 1.0:
+            remaining_steps = steps_total - steps_done
+            eta_seconds = remaining_steps / speed
+            eta_str = self._format_time(eta_seconds)
+        else:
+            eta_str = "--"
+
+        win_rate = rollout_stats.get("win_rate", 0.0) if rollout_stats else 0.0
+        skill_val = skill if skill is not None else 1000.0
+
+        # Build the status line
+        # Format: [progress bar] 7.5M/12M (62%) | 1234/s | Win:85% | Skill:30066 | ETA:2h15m
+        bar_width = 20
+        filled = int(bar_width * progress)
+        bar = "=" * filled + "-" * (bar_width - filled)
+
+        status = (
+            f"\r[{bar}] {self._format_number(timesteps)}/{self._format_number(self.total_timesteps)} "
+            f"({progress:>5.1%}) | {speed:>5.0f}/s | Win:{win_rate:>3.0%} | "
+            f"Skill:{skill_val:>5.0f} | Best:{best_skill:>5.0f} | ETA:{eta_str}"
+        )
+
+        # Pad to overwrite any previous longer line
+        status = status.ljust(120)
+
+        # Print in place (no newline)
+        print(status, end="", flush=True)
+        self._in_place_active = True
+
+    def message(self, msg: str):
+        """Print an important message on a new line."""
+        if self._in_place_active:
+            print()  # Move to new line first
+            self._in_place_active = False
+        print(f">> {msg}")
+
+
 class TrainablePlayer(Player):
     """A player that collects experiences for training."""
 
@@ -132,6 +259,9 @@ class TrainablePlayer(Player):
         self.model = model
         self.state_encoder = state_encoder
         self.device = device
+
+        # Mixed precision inference - disabled for now, overhead exceeds benefit for small models
+        self.use_amp = False  # device.type == "cuda"
 
         # Experience storage for current battle
         self.current_experiences: list[dict[str, Any]] = []
@@ -157,9 +287,9 @@ class TrainablePlayer(Player):
         field_state = state.field_state.unsqueeze(0).to(self.device)
         action_mask = state.action_mask.unsqueeze(0).to(self.device)
 
-        # Get action from model
-        with torch.no_grad():
-            self.model.eval()
+        # Get action from model with mixed precision inference
+        # Note: model.eval() is set once per rollout in the training loop, not per action
+        with torch.no_grad(), autocast("cuda", enabled=self.use_amp):
             action, log_prob, _, value = self.model.get_action_and_value(
                 player_pokemon,
                 opponent_pokemon,
@@ -285,6 +415,7 @@ class Trainer:
         use_self_play: bool = True,
         config: TrainingConfig | None = None,
         num_envs: int | None = None,
+        server_ports: list[int] | None = None,
     ):
         self.model = model
         self.device = device
@@ -294,6 +425,19 @@ class Trainer:
         self.config = config or training_config  # Use provided config or default
         self.num_envs = num_envs or self.config.num_envs
 
+        # Server configurations for distributing players across multiple servers
+        # This allows parallel training to scale beyond a single server's capacity
+        if server_ports:
+            self.server_configs = [
+                ServerConfiguration(
+                    websocket_url=f"ws://localhost:{port}/showdown/websocket",
+                    authentication_url="https://play.pokemonshowdown.com/action.php?",
+                )
+                for port in server_ports
+            ]
+        else:
+            self.server_configs = [None]  # Use default server
+
         # Create directories
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
@@ -301,9 +445,11 @@ class Trainer:
         # Initialize components
         self.state_encoder = StateEncoder(device=device)
         self.ppo = PPO.from_config(model, device=device, config=self.config)
+        # Buffer uses num_envs=1 since experiences are added one at a time
+        # from the shared queue (fast envs contribute more, slow ones less)
         self.buffer = RolloutBuffer(
             buffer_size=self.config.rollout_steps,
-            num_envs=self.num_envs,
+            num_envs=1,
             gamma=self.config.gamma,
             gae_lambda=self.config.gae_lambda,
             device=device,
@@ -327,6 +473,9 @@ class Trainer:
         self.stats = TrainingStats()
         self._best_win_rate: float = 0.0  # Track for tuning
 
+        # Load existing best model's skill to avoid overwriting better models
+        self._global_best_skill = self._load_existing_best_skill()
+
         # Graceful shutdown
         self._shutdown_requested = False
         self._memory_shutdown = False  # Triggered by memory monitor
@@ -342,49 +491,80 @@ class Trainer:
         """Create fresh player instances for training.
 
         Returns a list of TrainablePlayer instances, one per environment.
+        Players are distributed across available servers in round-robin fashion.
         """
-        players = [
-            TrainablePlayer(
-                model=self.model,
-                state_encoder=self.state_encoder,
-                device=self.device,
-                battle_format=self.config.battle_format,
-                max_concurrent_battles=1,
+        players = []
+        for i in range(self.num_envs):
+            # Distribute players across servers round-robin
+            server_config = self.server_configs[i % len(self.server_configs)]
+            players.append(
+                TrainablePlayer(
+                    model=self.model,
+                    state_encoder=self.state_encoder,
+                    device=self.device,
+                    battle_format=self.config.battle_format,
+                    max_concurrent_battles=1,
+                    server_configuration=server_config,
+                )
             )
-            for _ in range(self.num_envs)
-        ]
         return players
 
-    async def _cleanup_players(self, players: list[Player]) -> None:
-        """Clean up player websocket connections and free GPU memory."""
+    async def _cleanup_single_opponent(self, opponent: Player) -> None:
+        """Clean up a single opponent after its battle finishes naturally.
+
+        This is called from collect_rollout_single after each opponent's battles
+        complete, ensuring no race conditions with pending messages.
+        """
+        try:
+            if hasattr(opponent, 'ps_client') and opponent.ps_client is not None:
+                await opponent.ps_client.stop_listening()
+
+            # Free model memory for HistoricalPlayer opponents
+            if hasattr(opponent, 'model') and opponent.model is not None:
+                try:
+                    opponent.model.cpu()
+                    opponent.model = None
+                except Exception:
+                    pass
+            if hasattr(opponent, 'state_encoder'):
+                opponent.state_encoder = None
+        except Exception:
+            pass  # Ignore cleanup errors
+
+    async def _cleanup_players(self, players: list[Player], full_cleanup: bool = False) -> None:
+        """Clean up player websocket connections and optionally free GPU memory.
+
+        Args:
+            players: List of players to clean up
+            full_cleanup: If True, wait for websocket drain and free model memory.
+                         If False, just stop listening (faster, for most iterations).
+        """
+        # Stop listening on websockets
         cleanup_tasks = []
         for player in players:
             try:
-                # poke-env players have ps_client which manages the websocket
                 if hasattr(player, 'ps_client') and player.ps_client is not None:
                     cleanup_tasks.append(player.ps_client.stop_listening())
             except Exception:
-                pass  # Ignore cleanup errors
+                pass
 
-        # Wait for all cleanups to complete
         if cleanup_tasks:
             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-            # Longer delay to allow pending websocket messages to drain
-            # This prevents race conditions where choose_move is called after cleanup
-            await asyncio.sleep(0.5)
 
-        # Free memory from HistoricalPlayer models
-        # Set to None to break reference - choose_move has defensive check for this
-        for player in players:
-            if hasattr(player, 'model') and player.model is not None:
-                try:
-                    player.model.cpu()  # Move off GPU first
-                    player.model = None  # Break reference to allow GC
-                except Exception:
-                    pass
-            # Also clear state encoder reference
-            if hasattr(player, 'state_encoder'):
-                player.state_encoder = None
+            if full_cleanup:
+                await asyncio.sleep(0.3)
+
+        # Only free model memory during full cleanup
+        if full_cleanup:
+            for player in players:
+                if hasattr(player, 'model') and player.model is not None:
+                    try:
+                        player.model.cpu()
+                        player.model = None
+                    except Exception:
+                        pass
+                if hasattr(player, 'state_encoder'):
+                    player.state_encoder = None
 
     def _setup_signal_handlers(self) -> None:
         """Setup handlers for graceful shutdown."""
@@ -404,27 +584,66 @@ class Trainer:
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
 
+    def _setup_asyncio_exception_handler(self) -> None:
+        """Set up asyncio exception handler to suppress ConnectionClosedOK errors.
+
+        These errors are harmless and occur during normal cleanup when we close
+        websocket connections while battles are still in progress. They also occur
+        during shutdown. Suppressing them keeps the terminal output clean.
+        """
+        def silent_exception_handler(loop, context):
+            exception = context.get("exception")
+            if exception:
+                exc_name = type(exception).__name__
+                # Suppress all websocket connection closed errors
+                if "ConnectionClosed" in exc_name or "ConnectionReset" in exc_name:
+                    return  # Silently ignore
+            # Also check the message for connection-related errors
+            message = context.get("message", "")
+            if "ConnectionClosed" in message:
+                return
+            # For other exceptions, use default handler
+            loop.default_exception_handler(context)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(silent_exception_handler)
+        except RuntimeError:
+            pass  # No running loop, nothing to do
+
+    def _setup_logging_filter(self) -> None:
+        """Suppress noisy poke-env messages during training.
+
+        poke-env logs various non-critical messages (ConnectionClosedOK, Invalid choice, etc.)
+        that don't affect training. We disable logging at CRITICAL level since poke-env
+        uses CRITICAL for non-critical errors that it recovers from automatically.
+        """
+        # Disable all logging - poke-env uses CRITICAL for recoverable errors
+        # which clutters the output without providing actionable information
+        logging.disable(logging.CRITICAL)
+
     async def collect_rollout_single(
         self,
         player: TrainablePlayer,
         opponent: Player,
-        num_steps: int,
-    ) -> list[dict[str, Any]]:
-        """Collect experiences from a single environment.
+        experience_queue: asyncio.Queue,
+        stop_event: asyncio.Event,
+    ) -> None:
+        """Collect experiences from a single environment into shared queue.
+
+        Runs battles continuously until stop_event is set. Each battle completes
+        fully before checking stop_event, ensuring clean opponent cleanup.
 
         Args:
             player: The training player
             opponent: The opponent to play against
-            num_steps: Target number of steps to collect
-
-        Returns:
-            List of experiences
+            experience_queue: Shared queue to put experiences into
+            stop_event: Event that signals when to stop collecting
         """
-        all_experiences: list[dict[str, Any]] = []
-
-        while len(all_experiences) < num_steps:
-            # Check for shutdown request before starting a new battle
-            if self._shutdown_requested:
+        while not self._shutdown_requested:
+            # Check stop_event BEFORE starting a new battle (not during)
+            # This ensures battles always complete fully
+            if stop_event.is_set():
                 break
 
             # Play a battle with timeout to prevent hanging
@@ -434,79 +653,102 @@ class Trainer:
                     timeout=120.0  # 2 minute timeout per battle
                 )
             except asyncio.TimeoutError:
-                tqdm.write(f"\n  Battle timeout - skipping")
-                break
+                continue  # Skip this battle, try another
             except asyncio.CancelledError:
-                # Task was cancelled (e.g., during shutdown)
                 break
 
-            # Get experiences from the battle
+            # Get experiences from the battle and add to shared queue
             experiences = player.get_experiences()
-            all_experiences.extend(experiences)
+            for exp in experiences:
+                await experience_queue.put((player, exp))
 
-        return all_experiences
+        # Clean up this specific opponent after its battles are done
+        await self._cleanup_single_opponent(opponent)
 
     async def collect_rollout_parallel(
         self,
         players: list[TrainablePlayer],
         opponents: list[Player],
-        num_steps: int,
+        total_steps: int,
     ) -> list[list[dict[str, Any]]]:
         """Collect experiences from multiple environments in parallel.
+
+        Uses a shared queue so fast environments can contribute more while
+        slow ones are still battling. Stops when total_steps is reached.
+        Each battle completes fully before stopping, ensuring clean cleanup.
 
         Args:
             players: List of training players
             opponents: List of opponents
-            num_steps: Target steps per environment
+            total_steps: Total steps to collect across ALL environments
 
         Returns:
             List of experience lists (one per environment)
         """
-        # Run all environments in parallel
+        experience_queue: asyncio.Queue = asyncio.Queue()
+        stop_event = asyncio.Event()
+
+        # Start all environments collecting into shared queue
         tasks = [
-            asyncio.create_task(self.collect_rollout_single(player, opponent, num_steps))
+            asyncio.create_task(
+                self.collect_rollout_single(player, opponent, experience_queue, stop_event)
+            )
             for player, opponent in zip(players, opponents)
         ]
 
+        # Collect experiences from queue until we have enough
+        all_env_experiences: list[list[dict[str, Any]]] = [[] for _ in players]
+        player_to_idx = {id(p): i for i, p in enumerate(players)}
+        total_collected = 0
+
         try:
-            return await asyncio.gather(*tasks)
-        except asyncio.CancelledError:
-            # Cancel all pending tasks on shutdown
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            # Wait for cancellation to complete (with short timeout)
+            while total_collected < total_steps and not self._shutdown_requested:
+                try:
+                    # Wait for experience with timeout to check stop conditions
+                    player, exp = await asyncio.wait_for(experience_queue.get(), timeout=1.0)
+                    idx = player_to_idx[id(player)]
+                    all_env_experiences[idx].append(exp)
+                    total_collected += 1
+                except asyncio.TimeoutError:
+                    # Check if all tasks are done (no more experiences coming)
+                    if all(task.done() for task in tasks):
+                        break
+                    continue
+
+        finally:
+            # Signal collectors to stop after their current battle finishes
+            stop_event.set()
+
+            # Wait for battles to complete, but with a timeout
+            # If shutdown was requested, give a short timeout then force cancel
+            timeout = 5.0 if self._shutdown_requested else 30.0
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*tasks, return_exceptions=True),
-                    timeout=5.0
+                    timeout=timeout
                 )
             except asyncio.TimeoutError:
-                pass  # Some tasks didn't cancel in time, continue anyway
-            # Return whatever experiences were collected
-            results = []
-            for task in tasks:
-                try:
-                    if task.done() and not task.cancelled():
-                        results.append(task.result())
-                    else:
-                        results.append([])
-                except Exception:
-                    results.append([])
-            return results
+                # Force cancel any stuck tasks
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                # Wait briefly for cancellation to complete
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        return all_env_experiences
 
     async def collect_rollout_with_retry(
         self,
         players: list[TrainablePlayer],
         opponents: list[Player],
-        num_steps: int,
+        total_steps: int,
     ) -> tuple[list[list[dict[str, Any]]], list[TrainablePlayer], list[Player]]:
         """Collect rollouts with automatic retry on websocket errors.
 
         Args:
             players: List of training players
             opponents: List of opponents
-            num_steps: Target steps per environment
+            total_steps: Total steps to collect across ALL environments
 
         Returns:
             Tuple of (experiences, players, opponents) - players/opponents may be
@@ -515,19 +757,19 @@ class Trainer:
         for attempt in range(MAX_ROLLOUT_RETRIES):
             try:
                 experiences = await self.collect_rollout_parallel(
-                    players, opponents, num_steps
+                    players, opponents, total_steps
                 )
                 return experiences, players, opponents
 
             except (ConnectionClosed, ConnectionClosedError, OSError) as e:
                 # Websocket connection error - retry with fresh players
                 error_name = type(e).__name__
-                tqdm.write(
+                print(
                     f"\n  Connection error ({error_name}): {e}"
                 )
 
                 if attempt < MAX_ROLLOUT_RETRIES - 1:
-                    tqdm.write(
+                    print(
                         f"  Retrying ({attempt + 1}/{MAX_ROLLOUT_RETRIES}) "
                         f"in {RETRY_DELAY_SECONDS}s..."
                     )
@@ -560,7 +802,7 @@ class Trainer:
                     for player in players:
                         player.reset_stats()
                 else:
-                    tqdm.write(
+                    print(
                         f"  Max retries ({MAX_ROLLOUT_RETRIES}) exceeded. "
                         "Saving checkpoint and exiting..."
                     )
@@ -578,7 +820,8 @@ class Trainer:
     ) -> int:
         """Add experiences from multiple environments to the buffer.
 
-        Interleaves experiences from different environments for better mixing.
+        Handles uneven experience counts - fast environments contribute more.
+        Experiences are added in round-robin order for mixing.
 
         Args:
             all_env_experiences: List of experience lists (one per environment)
@@ -586,77 +829,42 @@ class Trainer:
         Returns:
             Total number of experiences added
         """
-        num_envs = len(all_env_experiences)
         total_added = 0
+        num_envs = len(all_env_experiences)
 
-        # Find the minimum length to ensure we don't go out of bounds
-        min_len = min(len(exp) for exp in all_env_experiences)
-        max_steps = min(min_len, self.buffer.buffer_size)
+        # Get lengths and create indices for round-robin iteration
+        lengths = [len(exps) for exps in all_env_experiences]
+        indices = [0] * num_envs  # Current index for each environment
+        max_len = max(lengths) if lengths else 0
 
-        for step in range(max_steps):
+        # Round-robin through environments, skipping exhausted ones
+        for _ in range(max_len):
             if self.buffer.ptr >= self.buffer.buffer_size:
                 break
 
-            # Gather data from all environments for this step
-            player_pokemon = np.stack([
-                all_env_experiences[env][step]["player_pokemon"]
-                for env in range(num_envs)
-            ])
-            opponent_pokemon = np.stack([
-                all_env_experiences[env][step]["opponent_pokemon"]
-                for env in range(num_envs)
-            ])
-            player_active_idx = np.array([
-                all_env_experiences[env][step]["player_active_idx"]
-                for env in range(num_envs)
-            ])
-            opponent_active_idx = np.array([
-                all_env_experiences[env][step]["opponent_active_idx"]
-                for env in range(num_envs)
-            ])
-            field_state = np.stack([
-                all_env_experiences[env][step]["field_state"]
-                for env in range(num_envs)
-            ])
-            action_mask = np.stack([
-                all_env_experiences[env][step]["action_mask"]
-                for env in range(num_envs)
-            ])
-            actions = np.array([
-                all_env_experiences[env][step]["action"]
-                for env in range(num_envs)
-            ])
-            log_probs = np.array([
-                all_env_experiences[env][step]["log_prob"]
-                for env in range(num_envs)
-            ])
-            rewards = np.array([
-                all_env_experiences[env][step]["reward"]
-                for env in range(num_envs)
-            ])
-            dones = np.array([
-                all_env_experiences[env][step]["done"]
-                for env in range(num_envs)
-            ])
-            values = np.array([
-                all_env_experiences[env][step]["value"]
-                for env in range(num_envs)
-            ])
+            for env in range(num_envs):
+                if indices[env] >= lengths[env]:
+                    continue  # This env is exhausted
+                if self.buffer.ptr >= self.buffer.buffer_size:
+                    break
 
-            self.buffer.add(
-                player_pokemon=player_pokemon,
-                opponent_pokemon=opponent_pokemon,
-                player_active_idx=player_active_idx,
-                opponent_active_idx=opponent_active_idx,
-                field_state=field_state,
-                action_mask=action_mask,
-                action=actions,
-                log_prob=log_probs,
-                reward=rewards,
-                done=dones,
-                value=values,
-            )
-            total_added += num_envs
+                exp = all_env_experiences[env][indices[env]]
+                indices[env] += 1
+
+                self.buffer.add(
+                    player_pokemon=exp["player_pokemon"][np.newaxis, ...],
+                    opponent_pokemon=exp["opponent_pokemon"][np.newaxis, ...],
+                    player_active_idx=np.array([exp["player_active_idx"]]),
+                    opponent_active_idx=np.array([exp["opponent_active_idx"]]),
+                    field_state=exp["field_state"][np.newaxis, ...],
+                    action_mask=exp["action_mask"][np.newaxis, ...],
+                    action=np.array([exp["action"]]),
+                    log_prob=np.array([exp["log_prob"]]),
+                    reward=np.array([exp["reward"]]),
+                    done=np.array([exp["done"]]),
+                    value=np.array([exp["value"]]),
+                )
+                total_added += 1
 
         return total_added
 
@@ -694,62 +902,58 @@ class Trainer:
             save_interval: Steps between saving checkpoints
         """
         self._setup_signal_handlers()
+        self._setup_asyncio_exception_handler()
+        self._setup_logging_filter()
 
-        total_timesteps = total_timesteps or self.config.total_timesteps
+        timesteps_to_train = total_timesteps or self.config.total_timesteps
         eval_interval = eval_interval or self.config.eval_interval
         save_interval = save_interval or self.config.checkpoint_interval
+
+        # Calculate target: train for timesteps_to_train MORE steps from current position
+        starting_timesteps = self.stats.total_timesteps
+        target_timesteps = starting_timesteps + timesteps_to_train
 
         # Setup TensorBoard if not resuming
         if self.writer is None:
             self._run_name = f"ppo_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             self.writer = SummaryWriter(log_dir=str(self.log_dir / self._run_name))
 
+        # Print startup info (one-time, not part of updating display)
         print("=" * 60)
         print("Pokemon Showdown RL Bot - Training")
         print("=" * 60)
         print(f"Device: {self.device}")
-        print(f"Total timesteps: {total_timesteps:,}")
-        print(f"Starting from: {self.stats.total_timesteps:,}")
+        print(f"Training for: {timesteps_to_train:,} steps")
+        print(f"Starting from: {starting_timesteps:,}")
+        print(f"Target: {target_timesteps:,}")
         print(f"Parallel environments: {self.num_envs}")
-        print(f"Rollout steps: {self.config.rollout_steps}")
-        print(f"Batch size: {self.config.batch_size}")
-        print(f"Learning rate: {self.config.learning_rate}")
         print(f"Self-play: {'Enabled' if self.use_self_play else 'Disabled'}")
-        if self.self_play_manager:
-            print(f"Agent Skill: {self.self_play_manager.agent_skill:.0f}")
-            print(f"Opponent pool size: {self.self_play_manager.opponent_pool.size}")
-        print(f"Memory: {self.memory_monitor.get_memory_status_string()}")
-        print(f"Memory limits: soft={self.memory_monitor.soft_limit_percent}%, hard={self.memory_monitor.hard_limit_percent}%")
         print("=" * 60)
-        print("Press Ctrl+C to stop and save checkpoint")
-        print("=" * 60)
+        print()
 
         # Create multiple players for parallel environments
         players = self._create_players()
 
-        # Training loop
-        pbar = tqdm(
-            total=total_timesteps,
-            initial=self.stats.total_timesteps,
-            desc="Training",
+        # Create display
+        display = TrainingDisplay(
+            total_timesteps=target_timesteps,
+            start_timesteps=starting_timesteps,
         )
+        display.initialize()
 
         try:
-            while self.stats.total_timesteps < total_timesteps and not self._shutdown_requested:
+            while self.stats.total_timesteps < target_timesteps and not self._shutdown_requested:
                 # Check memory usage at the start of each iteration
                 mem_status, mem_percent = self.memory_monitor.check_memory()
                 if mem_status == "hard_limit":
-                    tqdm.write(
-                        f"\n[CRITICAL] Memory usage at {mem_percent:.1f}% - FORCE QUITTING!"
-                    )
-                    tqdm.write("Attempting emergency checkpoint save...")
+                    display.close()
+                    print(f"\n[CRITICAL] Memory usage at {mem_percent:.1f}% - FORCE QUITTING!")
+                    print("Attempting emergency checkpoint save...")
                     self._save_checkpoint("emergency_memory_checkpoint.pt")
-                    tqdm.write(f"Emergency checkpoint saved.")
+                    print("Emergency checkpoint saved.")
                     sys.exit(1)
                 elif mem_status == "soft_limit":
-                    tqdm.write(
-                        f"\n[WARNING] Memory usage at {mem_percent:.1f}% - initiating graceful shutdown"
-                    )
+                    display.message(f"Memory at {mem_percent:.1f}% - initiating graceful shutdown")
                     self._shutdown_requested = True
                     self._memory_shutdown = True
                     break
@@ -760,12 +964,15 @@ class Trainer:
                     player.reset_stats()
 
                 # Create opponents for each environment
+                # Opponents must connect to the same server as their corresponding player
                 opponents = []
                 opponent_infos = []
-                for _ in range(self.num_envs):
+                for i in range(self.num_envs):
+                    server_config = self.server_configs[i % len(self.server_configs)]
                     if self.self_play_manager:
                         opponent, opponent_info = self.self_play_manager.get_opponent(
-                            self.config.battle_format
+                            self.config.battle_format,
+                            server_configuration=server_config,
                         )
                         opponents.append(opponent)
                         opponent_infos.append(opponent_info)
@@ -773,13 +980,17 @@ class Trainer:
                         opponents.append(RandomPlayer(
                             battle_format=self.config.battle_format,
                             max_concurrent_battles=1,
+                            server_configuration=server_config,
                         ))
                         opponent_infos.append(None)
 
+                # Set model to eval mode once for the entire rollout (not per action)
+                self.model.eval()
+
                 # Collect rollouts in parallel with automatic retry on connection errors
-                steps_per_env = self.config.rollout_steps // self.num_envs
+                # Pass total steps - fast envs contribute more while slow ones are still battling
                 all_env_experiences, players, opponents = await self.collect_rollout_with_retry(
-                    players, opponents, steps_per_env
+                    players, opponents, self.config.rollout_steps
                 )
 
                 # Aggregate rollout stats from all players
@@ -806,9 +1017,9 @@ class Trainer:
                 # Add to buffer
                 total_added = self.add_experiences_to_buffer_parallel(all_env_experiences)
 
-                # Compute advantages
-                last_value = np.zeros((self.num_envs,), dtype=np.float32)
-                last_done = np.ones((self.num_envs,), dtype=np.float32)
+                # Compute advantages (buffer uses num_envs=1)
+                last_value = np.zeros((1,), dtype=np.float32)
+                last_done = np.ones((1,), dtype=np.float32)
                 self.buffer.compute_advantages(last_value, last_done)
 
                 # PPO update
@@ -820,71 +1031,84 @@ class Trainer:
                 self.stats.total_episodes += rollout_stats["battles"]
                 self.stats.total_updates += 1
 
-                # Log to TensorBoard
-                self._log_training(rollout_stats, ppo_stats)
+                # Log to TensorBoard (every 5 iterations to reduce I/O overhead)
+                if self.stats.total_updates % 5 == 0:
+                    self._log_training(rollout_stats, ppo_stats)
 
-                # Update progress bar
-                pbar.update(total_added)
-                postfix = {
-                    "win_rate": f"{rollout_stats['win_rate']:.1%}",
-                    "reward": f"{rollout_stats['avg_reward']:.2f}",
-                    "loss": f"{ppo_stats.total_loss:.3f}",
-                }
-                if self.self_play_manager:
-                    postfix["skill"] = f"{self.self_play_manager.agent_skill:.0f}"
-                pbar.set_postfix(postfix)
+                # Update display
+                _, mem_percent = self.memory_monitor.check_memory()
+                display.update(
+                    timesteps=self.stats.total_timesteps,
+                    rollout_stats=rollout_stats,
+                    ppo_stats=ppo_stats,
+                    skill=self.self_play_manager.agent_skill if self.self_play_manager else None,
+                    pool_size=self.self_play_manager.opponent_pool.size if self.self_play_manager else 0,
+                    memory_str=self.memory_monitor.get_memory_status_string(),
+                    memory_percent=mem_percent,
+                    best_skill=self._global_best_skill,
+                )
 
                 # Add checkpoint to self-play pool
                 if self.self_play_manager and self.self_play_manager.should_add_checkpoint(
                     self.stats.total_timesteps
                 ):
                     self.self_play_manager.add_checkpoint(self.model, self.stats.total_timesteps)
-                    print(f"\n  Added checkpoint to opponent pool (size: {self.self_play_manager.opponent_pool.size})")
+                    display.message(f"Added checkpoint to opponent pool (size: {self.self_play_manager.opponent_pool.size})")
 
                 # Save checkpoint periodically
                 if self.stats.total_timesteps % save_interval < total_added:
                     self._save_checkpoint()
 
-                # Track best win rate
+                # Track best win rate (session best)
                 if rollout_stats["win_rate"] > self.stats.best_win_rate:
                     self.stats.best_win_rate = rollout_stats["win_rate"]
                     self._best_win_rate = rollout_stats["win_rate"]  # For tuning
-                    self._save_checkpoint("best_model.pt")
 
-                # Clean up opponent connections and free memory
-                await self._cleanup_players(opponents)
+                # Save best_model.pt based on skill rating (not win rate, since win rate caps at 100%)
+                # Only save if we beat the global best from existing best_model.pt
+                if self.self_play_manager:
+                    current_skill = self.self_play_manager.agent_skill
+                    if current_skill > self._global_best_skill:
+                        old_best = self._global_best_skill
+                        self._global_best_skill = current_skill
+                        self._save_checkpoint("best_model.pt")
+                        display.message(f"NEW BEST MODEL! Skill: {old_best:.0f} -> {current_skill:.0f}")
 
-                # Force garbage collection to free HistoricalPlayer models
-                # Safe now because _cleanup_players waits for websockets to drain
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Opponents are now cleaned up individually in collect_rollout_single
+                # after each battle finishes naturally. Just do periodic GC.
+                if self.stats.total_updates % 10 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         except asyncio.CancelledError:
             # Task was cancelled during shutdown - this is expected
-            print("\nTraining cancelled.")
+            display.close()
+            print("Training cancelled.")
         except Exception as e:
-            print(f"\nError during training: {e}")
+            display.close()
+            print(f"Error during training: {e}")
             print("Saving emergency checkpoint...")
             self._save_checkpoint("emergency_checkpoint.pt")
             raise
         finally:
-            # Clean up player connections
+            # Clean up player connections (full cleanup since we're shutting down)
             try:
-                await self._cleanup_players(players)
+                await self._cleanup_players(players, full_cleanup=True)
             except Exception:
                 pass  # Ignore cleanup errors
 
-            # Always save on exit
-            pbar.close()
+            # Close display and save checkpoint
+            display.close()
             if self._shutdown_requested or self.stats.total_timesteps > 0:
                 self._save_checkpoint("latest.pt")
-                print(f"\nCheckpoint saved to: {self.save_dir / 'latest.pt'}")
 
             if self.writer:
                 self.writer.close()
 
-        print("\n" + "=" * 60)
+        # Print final summary
+        print()
+        print("=" * 60)
         if self._memory_shutdown:
             print("Training Stopped - HIGH MEMORY USAGE (checkpoint saved)")
             print(f"Memory at shutdown: {self.memory_monitor.get_memory_status_string()}")
@@ -897,9 +1121,8 @@ class Trainer:
         print(f"Best win rate: {self.stats.best_win_rate:.1%}")
         if self.self_play_manager:
             print(f"Final Skill: {self.self_play_manager.agent_skill:.0f}")
+        print(f"Checkpoint saved: {self.save_dir / 'latest.pt'}")
         print("=" * 60)
-        print(f"\nTo resume training, run:")
-        print(f"  python scripts/train.py --resume {self.save_dir / 'latest.pt'}")
 
     def _log_training(self, rollout_stats: dict[str, float], ppo_stats: PPOStats) -> None:
         """Log training metrics to TensorBoard."""
@@ -936,6 +1159,28 @@ class Trainer:
             self.writer.add_scalar("self_play/games_vs_self_play", sp_stats["games_vs_self_play"], step)
             self.writer.add_scalar("self_play/games_vs_random", sp_stats["games_vs_random"], step)
 
+    def _load_existing_best_skill(self) -> float:
+        """Load the skill rating from existing best_model.pt if it exists.
+
+        This prevents overwriting a better model from a previous training run
+        with a worse model from a new run that starts fresh. Skill rating is
+        used instead of win rate because win rate caps at 100%, while skill
+        continues to grow as the model beats stronger opponents.
+        """
+        best_model_path = self.save_dir / "best_model.pt"
+        if best_model_path.exists():
+            try:
+                checkpoint = torch.load(best_model_path, map_location="cpu", weights_only=False)
+                skill = checkpoint.get("self_play", {}).get("agent_skill", 0.0)
+                steps = checkpoint.get("stats", {}).get("total_timesteps", 0)
+                print(f"Loaded best_model.pt: Skill={skill:.0f}, Steps={steps:,}")
+                return skill
+            except Exception as e:
+                print(f"Warning: Could not load best_model.pt: {e}")
+                return 0.0
+        print("No existing best_model.pt found, starting fresh")
+        return 0.0
+
     def _save_checkpoint(self, filename: str | None = None) -> None:
         """Save a training checkpoint.
 
@@ -970,7 +1215,23 @@ class Trainer:
             }
 
         torch.save(checkpoint, path)
-        tqdm.write(f"Saved checkpoint: {path}")
+
+        # Verify best_model.pt saves to ensure we don't lose the best model
+        if filename == "best_model.pt":
+            # Verify the save by reading it back
+            try:
+                verify = torch.load(path, map_location="cpu", weights_only=False)
+                saved_skill = verify.get("self_play", {}).get("agent_skill", 0)
+                saved_steps = verify.get("stats", {}).get("total_timesteps", 0)
+                expected_skill = checkpoint.get("self_play", {}).get("agent_skill", 0)
+                if abs(saved_skill - expected_skill) > 0.1:
+                    print(f"ERROR: best_model.pt verification failed! Expected skill {expected_skill}, got {saved_skill}")
+                else:
+                    print(f"Saved best_model.pt: Skill={saved_skill:.0f}, Steps={saved_steps:,} [VERIFIED]")
+            except Exception as e:
+                print(f"ERROR: Could not verify best_model.pt: {e}")
+        else:
+            print(f"Saved checkpoint: {path}")
 
         # Always update latest.pt when saving numbered checkpoints
         # This ensures resume works even after unexpected termination (kill/crash)

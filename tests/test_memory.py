@@ -293,8 +293,8 @@ class TestTrainerCleanup:
         mock_player.model = model
         mock_player.ps_client = None
 
-        # Run cleanup
-        asyncio.run(trainer._cleanup_players([mock_player]))
+        # Run cleanup with full_cleanup=True to test model removal
+        asyncio.run(trainer._cleanup_players([mock_player], full_cleanup=True))
 
         # Model should be set to None to allow garbage collection
         assert mock_player.model is None
@@ -345,7 +345,7 @@ class TestTrainerCleanup:
         ok_player.model = ok_model
 
         # Should not raise, even with failing player
-        asyncio.run(trainer._cleanup_players([failing_player, ok_player]))
+        asyncio.run(trainer._cleanup_players([failing_player, ok_player], full_cleanup=True))
 
         # Second player's model should be set to None to allow GC
         assert ok_player.model is None

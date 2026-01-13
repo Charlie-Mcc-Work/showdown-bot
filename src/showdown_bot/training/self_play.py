@@ -6,9 +6,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch.amp import autocast
 from poke_env.player import Player
 from poke_env.player.battle_order import BattleOrder
 from poke_env.battle import AbstractBattle
+from poke_env.ps_client import ServerConfiguration
 
 from showdown_bot.config import training_config
 from showdown_bot.environment.state_encoder import StateEncoder
@@ -50,6 +52,9 @@ class HistoricalPlayer(Player):
         self.state_encoder = state_encoder
         self.device = device
 
+        # Mixed precision inference - disabled for now, overhead exceeds benefit for small models
+        self.use_amp = False  # device.type == "cuda"
+
         # Load model from checkpoint
         self.model = model_class.from_config().to(device)
         self._load_checkpoint(checkpoint_path)
@@ -85,7 +90,7 @@ class HistoricalPlayer(Player):
         field_state = state.field_state.unsqueeze(0).to(self.device)
         action_mask = state.action_mask.unsqueeze(0).to(self.device)
 
-        with torch.no_grad():
+        with torch.no_grad(), autocast("cuda", enabled=self.use_amp):
             logits, _ = self.model(
                 player_pokemon,
                 opponent_pokemon,
@@ -261,12 +266,14 @@ class OpponentPool:
         self,
         opponent_info: OpponentInfo,
         battle_format: str,
+        server_configuration: ServerConfiguration | None = None,
     ) -> HistoricalPlayer:
         """Create a player from an opponent info.
 
         Args:
             opponent_info: The opponent to create a player for
             battle_format: Pokemon Showdown battle format
+            server_configuration: Server to connect to (None for default)
 
         Returns:
             A HistoricalPlayer instance
@@ -278,6 +285,7 @@ class OpponentPool:
             device=self.device,
             battle_format=battle_format,
             max_concurrent_battles=1,
+            server_configuration=server_configuration,
         )
 
     def update_stats(
@@ -426,11 +434,13 @@ class SelfPlayManager:
     def get_opponent(
         self,
         battle_format: str,
+        server_configuration: ServerConfiguration | None = None,
     ) -> tuple[Player, OpponentInfo | None]:
         """Get an opponent to play against.
 
         Args:
             battle_format: Pokemon Showdown battle format
+            server_configuration: Server to connect to (None for default)
 
         Returns:
             Tuple of (opponent_player, opponent_info or None for random)
@@ -443,7 +453,9 @@ class SelfPlayManager:
                 current_skill=self.agent_skill,
             )
             if opponent_info:
-                player = self.opponent_pool.create_player(opponent_info, battle_format)
+                player = self.opponent_pool.create_player(
+                    opponent_info, battle_format, server_configuration
+                )
                 self.games_vs_self_play += 1
                 return player, opponent_info
 
@@ -452,6 +464,7 @@ class SelfPlayManager:
         return RandomPlayer(
             battle_format=battle_format,
             max_concurrent_battles=1,
+            server_configuration=server_configuration,
         ), None
 
     def update_after_game(

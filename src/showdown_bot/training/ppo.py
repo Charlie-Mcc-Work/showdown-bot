@@ -6,6 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from showdown_bot.config import training_config, TrainingConfig
@@ -69,6 +70,10 @@ class PPO:
 
         self.optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, eps=1e-5)
 
+        # Mixed precision training - disabled for now, overhead exceeds benefit for small models
+        self.use_amp = False  # self.device.type == "cuda"
+        self.scaler = GradScaler("cuda", enabled=self.use_amp)
+
     def update(self, buffer: RolloutBuffer, batch_size: int) -> PPOStats:
         """Perform a PPO update using data from the buffer.
 
@@ -104,58 +109,62 @@ class PPO:
             batches = buffer.get_batches(batch_size, shuffle=True)
 
             for batch in batches:
-                # Get current policy outputs
-                _, log_probs, entropy, values = self.model.get_action_and_value(
-                    player_pokemon=batch["player_pokemon"],
-                    opponent_pokemon=batch["opponent_pokemon"],
-                    player_active_idx=batch["player_active_idx"],
-                    opponent_active_idx=batch["opponent_active_idx"],
-                    field_state=batch["field_state"],
-                    action_mask=batch["action_mask"],
-                    action=batch["actions"],
-                )
+                # Mixed precision forward pass and loss computation
+                with autocast("cuda", enabled=self.use_amp):
+                    # Get current policy outputs
+                    _, log_probs, entropy, values = self.model.get_action_and_value(
+                        player_pokemon=batch["player_pokemon"],
+                        opponent_pokemon=batch["opponent_pokemon"],
+                        player_active_idx=batch["player_active_idx"],
+                        opponent_active_idx=batch["opponent_active_idx"],
+                        field_state=batch["field_state"],
+                        action_mask=batch["action_mask"],
+                        action=batch["actions"],
+                    )
 
-                # Compute ratio for PPO
-                log_ratio = log_probs - batch["old_log_probs"]
-                ratio = torch.exp(log_ratio)
+                    # Compute ratio for PPO
+                    log_ratio = log_probs - batch["old_log_probs"]
+                    ratio = torch.exp(log_ratio)
 
-                # Approximate KL divergence for early stopping
+                    # Clipped surrogate objective
+                    advantages = batch["advantages"]
+                    surrogate1 = ratio * advantages
+                    surrogate2 = torch.clamp(
+                        ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon
+                    ) * advantages
+                    policy_loss = -torch.min(surrogate1, surrogate2).mean()
+
+                    # Value loss with clipping
+                    values_clipped = batch["old_values"] + torch.clamp(
+                        values - batch["old_values"],
+                        -self.clip_epsilon,
+                        self.clip_epsilon,
+                    )
+                    value_loss1 = F.mse_loss(values, batch["returns"])
+                    value_loss2 = F.mse_loss(values_clipped, batch["returns"])
+                    value_loss = torch.max(value_loss1, value_loss2)
+
+                    # Entropy bonus (for exploration)
+                    entropy_loss = -entropy.mean()
+
+                    # Total loss
+                    loss = (
+                        policy_loss
+                        + self.value_coef * value_loss
+                        + self.entropy_coef * entropy_loss
+                    )
+
+                # Approximate KL divergence for early stopping (outside autocast)
                 with torch.no_grad():
                     approx_kl = ((ratio - 1) - log_ratio).mean().item()
 
-                # Clipped surrogate objective
-                advantages = batch["advantages"]
-                surrogate1 = ratio * advantages
-                surrogate2 = torch.clamp(
-                    ratio, 1 - self.clip_epsilon, 1 + self.clip_epsilon
-                ) * advantages
-                policy_loss = -torch.min(surrogate1, surrogate2).mean()
-
-                # Value loss with clipping
-                values_clipped = batch["old_values"] + torch.clamp(
-                    values - batch["old_values"],
-                    -self.clip_epsilon,
-                    self.clip_epsilon,
-                )
-                value_loss1 = F.mse_loss(values, batch["returns"])
-                value_loss2 = F.mse_loss(values_clipped, batch["returns"])
-                value_loss = torch.max(value_loss1, value_loss2)
-
-                # Entropy bonus (for exploration)
-                entropy_loss = -entropy.mean()
-
-                # Total loss
-                loss = (
-                    policy_loss
-                    + self.value_coef * value_loss
-                    + self.entropy_coef * entropy_loss
-                )
-
-                # Optimize
+                # Optimize with gradient scaling for mixed precision
                 self.optimizer.zero_grad()
-                loss.backward()
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
                 # Track statistics
                 with torch.no_grad():
@@ -225,17 +234,20 @@ class PPO:
         )
 
     def save(self, path: str) -> None:
-        """Save model and optimizer state."""
+        """Save model, optimizer, and scaler state."""
         torch.save(
             {
                 "model_state_dict": self.model.state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
+                "scaler_state_dict": self.scaler.state_dict(),
             },
             path,
         )
 
     def load(self, path: str) -> None:
-        """Load model and optimizer state."""
+        """Load model, optimizer, and scaler state."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scaler_state_dict" in checkpoint:
+            self.scaler.load_state_dict(checkpoint["scaler_state_dict"])

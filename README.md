@@ -103,7 +103,32 @@ The server runs on `localhost:8000` by default.
 
 ## Training
 
-### Quick Start
+### Recommended: Automated Training Script
+
+The easiest way to train is with the automated script that handles everything:
+
+```bash
+./scripts/run_training.sh
+```
+
+This script:
+- Starts multiple Pokemon Showdown servers automatically
+- Runs training with parallel environments distributed across servers
+- Auto-resumes from the best checkpoint
+- Restarts automatically on memory issues or run completion (5M steps per run)
+- Ctrl+C gracefully saves checkpoint and exits
+
+**Options:**
+```bash
+./scripts/run_training.sh --help                    # Show all options
+./scripts/run_training.sh --num-envs 15             # Use 15 parallel environments
+./scripts/run_training.sh --num-servers 6           # Use 6 PS servers
+./scripts/run_training.sh --timesteps 1000000       # 1M steps per run
+```
+
+### Manual Training
+
+For more control, run training manually:
 
 ```bash
 # Terminal 1: Start Pokemon Showdown server
@@ -123,6 +148,7 @@ python scripts/train.py
 | `python scripts/train.py --resume path/to/checkpoint.pt` | Resume from specific checkpoint |
 | `python scripts/train.py -t 100000` | Train for 100k steps |
 | `python scripts/train.py --num-envs 4` | Use 4 parallel environments |
+| `python scripts/train.py --server-ports 8000 8001 8002` | Use multiple servers |
 | `python scripts/train.py --no-self-play` | Train against random opponents only |
 
 ### Stopping Training

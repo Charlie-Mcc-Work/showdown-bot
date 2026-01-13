@@ -13,17 +13,35 @@ See `src/showdown_bot/ou/README.md` for full OU documentation.
 
 ## Quick Start
 
-**Prerequisite**: Start Pokemon Showdown server:
+**Prerequisite**: Pokemon Showdown installed at `~/pokemon-showdown`
 ```bash
-cd ~/pokemon-showdown && node pokemon-showdown start --no-security
+# If not installed:
+git clone https://github.com/smogon/pokemon-showdown.git ~/pokemon-showdown
+cd ~/pokemon-showdown && npm install
 ```
 
 ### Random Battles Training
+
+**Recommended: Automated training script**
+```bash
+./scripts/run_training.sh    # Does everything automatically
+```
+This script:
+- Starts 3 Pokemon Showdown servers automatically
+- Runs training with 12 parallel environments across all servers
+- Auto-resumes from checkpoint
+- Restarts on memory issues or run completion (5M steps per run)
+- Ctrl+C gracefully saves checkpoint and exits
+
+**Manual training:**
 ```bash
 python scripts/train.py                    # Train with self-play
 python scripts/train.py --num-envs 4       # Parallel envs (faster)
 python scripts/train.py --resume           # Resume from checkpoint
 tensorboard --logdir runs/                 # Monitor
+
+# Multi-server (manual)
+python scripts/train.py --num-envs 12 --server-ports 8000 8001 8002
 ```
 
 ### OU Training

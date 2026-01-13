@@ -80,6 +80,7 @@ async def train(args: argparse.Namespace) -> None:
         self_play_dir=args.self_play_dir,
         use_self_play=not args.no_self_play,
         num_envs=args.num_envs,
+        server_ports=args.server_ports,
     )
 
     # Load checkpoint if provided
@@ -99,8 +100,14 @@ async def train(args: argparse.Namespace) -> None:
     # Start training
     print("\n" + "=" * 60)
     print("NOTE: Training requires a Pokemon Showdown server running locally.")
-    print("If not running, start it with:")
-    print("  cd ~/pokemon-showdown && node pokemon-showdown start --no-security")
+    if args.server_ports:
+        print(f"Using {len(args.server_ports)} servers on ports: {args.server_ports}")
+        print("Make sure all servers are running:")
+        for port in args.server_ports:
+            print(f"  node pokemon-showdown start --no-security --port {port}")
+    else:
+        print("If not running, start it with:")
+        print("  cd ~/pokemon-showdown && node pokemon-showdown start --no-security")
     print("=" * 60 + "\n")
 
     try:
@@ -181,6 +188,14 @@ def main() -> None:
         type=int,
         default=training_config.num_envs,
         help="Number of parallel environments for faster training",
+    )
+    parser.add_argument(
+        "--server-ports",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Pokemon Showdown server ports (e.g., --server-ports 8000 8001 8002). "
+             "Environments are distributed across servers round-robin.",
     )
 
     args = parser.parse_args()
