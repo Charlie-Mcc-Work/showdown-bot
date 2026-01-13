@@ -24,9 +24,39 @@ cd ~/pokemon-showdown && npm install
 
 ### Training Commands
 
-**Automated Training Script (RECOMMENDED)**
+**Parallel Training Script (FASTEST - bypasses Python GIL)**
 
-The easiest way to train is with the automated script that handles everything:
+For maximum throughput, use parallel training with multiple Python processes:
+```bash
+./scripts/run_training_ou_parallel.sh
+```
+
+This script:
+- Runs multiple Python worker processes (bypasses Python's GIL bottleneck)
+- Each worker gets its own servers and environments
+- All workers share the opponent pool for collaborative self-play
+- Auto-resumes from best checkpoint
+- Ctrl+C gracefully saves all workers
+- Best model is merged at end
+
+**Options:**
+```bash
+./scripts/run_training_ou_parallel.sh --help              # Show all options
+./scripts/run_training_ou_parallel.sh --workers 6         # 6 parallel Python processes
+./scripts/run_training_ou_parallel.sh --envs-per-worker 3 # 3 envs per worker
+./scripts/run_training_ou_parallel.sh --mode player       # Player training only
+./scripts/run_training_ou_parallel.sh --curriculum adaptive  # Curriculum strategy
+```
+
+**Monitor parallel training:**
+```bash
+./scripts/monitor_training_ou.sh   # Shows combined stats from all workers
+tail -f logs/ou_worker_0.log       # Watch individual worker
+```
+
+**Single-Process Training Script**
+
+For simpler setup (single Python process with multiple servers):
 ```bash
 ./scripts/run_training_ou.sh
 ```

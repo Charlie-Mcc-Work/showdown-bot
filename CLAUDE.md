@@ -22,16 +22,27 @@ cd ~/pokemon-showdown && npm install
 
 ### Random Battles Training
 
-**Recommended: Automated training script**
+**Recommended: Parallel training (bypasses Python GIL)**
 ```bash
-./scripts/run_training.sh    # Does everything automatically
+./scripts/run_training_parallel.sh    # Maximum throughput
 ```
 This script:
-- Starts 3 Pokemon Showdown servers automatically
-- Runs training with 12 parallel environments across all servers
-- Auto-resumes from checkpoint
-- Restarts on memory issues or run completion (5M steps per run)
-- Ctrl+C gracefully saves checkpoint and exits
+- Runs multiple Python worker processes (bypasses GIL bottleneck)
+- Each worker has its own servers and environments
+- All workers share opponent pool for collaborative self-play
+- Auto-resumes from best checkpoint
+- Ctrl+C gracefully saves all workers
+
+**Options:**
+```bash
+./scripts/run_training_parallel.sh --workers 6 --envs-per-worker 3  # 18 total envs
+./scripts/monitor_training.sh  # Monitor combined stats from all workers
+```
+
+**Single-process training:**
+```bash
+./scripts/run_training.sh    # Simpler setup, single Python process
+```
 
 **Manual training:**
 ```bash
@@ -39,30 +50,34 @@ python scripts/train.py                    # Train with self-play
 python scripts/train.py --num-envs 4       # Parallel envs (faster)
 python scripts/train.py --resume           # Resume from checkpoint
 tensorboard --logdir runs/                 # Monitor
-
-# Multi-server (manual)
-python scripts/train.py --num-envs 12 --server-ports 8000 8001 8002
-```
-
-**Multi-process training (bypasses GIL):**
-```bash
-# For better CPU utilization with multi-core systems
-./scripts/run_training_multiproc.sh --workers 4 --envs-per-worker 4
-# = 16 total envs across 4 Python processes, fully utilizing multiple CPU cores
 ```
 
 ### OU Training
+
+**Recommended: Parallel training (bypasses Python GIL)**
 ```bash
-# Joint training (recommended) - trains player + teambuilder together
+./scripts/run_training_ou_parallel.sh    # Maximum throughput
+./scripts/monitor_training_ou.sh         # Monitor combined stats
+```
+
+**Single-process training:**
+```bash
+./scripts/run_training_ou.sh             # Simpler setup
+```
+
+**Manual training:**
+```bash
+# Joint training - trains player + teambuilder together
 python scripts/train_ou.py --mode joint --num-envs 4
 
 # With curriculum learning
 python scripts/train_ou.py --mode joint --curriculum adaptive  # default
-python scripts/train_ou.py --mode joint --curriculum progressive
 
 # Player only (with sample teams)
 python scripts/train_ou.py --mode player
 ```
+
+See `src/showdown_bot/ou/README.md` for full OU documentation.
 
 ### Browser Play
 ```bash
@@ -87,7 +102,9 @@ uv run python scripts/coach_server.py
 
 | Area | Files |
 |------|-------|
-| Training | `scripts/train.py`, `scripts/train_ou.py`, `scripts/train_multiproc.py` |
+| Training | `scripts/train.py`, `scripts/train_ou.py` |
+| Parallel | `scripts/run_training_parallel.sh`, `scripts/run_training_ou_parallel.sh` |
+| Monitoring | `scripts/monitor_training.sh`, `scripts/monitor_training_ou.sh` |
 | Network | `src/showdown_bot/models/network.py` |
 | PPO | `src/showdown_bot/training/ppo.py` |
 | Self-play | `src/showdown_bot/training/self_play.py` |
@@ -108,4 +125,4 @@ uv run python scripts/coach_server.py
 - Reward: win/loss + HP differential + KO bonus
 - Browser extension uses `world: "MAIN"` to access PS variables
 - Battle request at `app.curRoom.request` (not `.battle.request`)
-- Standard training is single-threaded due to Python's GIL; use `train_multiproc.py` for multi-core CPUs
+- Use parallel training scripts (`run_training_parallel.sh`) for multi-core CPUs to bypass Python's GIL
