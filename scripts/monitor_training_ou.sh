@@ -120,8 +120,8 @@ while true; do
         eta="--"
     fi
 
-    # Display combined stats
-    echo -ne "\r[${bar}${bar_empty}] ${total_fmt} | ${CYAN}${total_speed}/s${NC} | Workers:${active_workers}/${num_workers} | Win:${avg_win}% | Skill:${best_skill} | Ep:${total_episodes} | ETA:${eta}    "
+    # Display combined stats (percentage and ETA right after progress bar)
+    echo -ne "\r[${bar}${bar_empty}] ${pct}% | ETA:${eta} | ${total_fmt} | ${CYAN}${total_speed}/s${NC} | Workers:${active_workers}/${num_workers} | Win:${avg_win}% | Skill:${best_skill} | Ep:${total_episodes}    "
 
     sleep 2
 done

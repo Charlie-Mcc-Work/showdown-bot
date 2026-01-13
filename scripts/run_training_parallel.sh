@@ -341,9 +341,39 @@ main() {
     echo ""
 
     start_servers
-    start_workers
-    monitor_workers
-    merge_checkpoints
+
+    RUN_COUNT=0
+
+    # Training loop - continues until Ctrl+C
+    while true; do
+        if [ "$USER_EXIT_REQUESTED" = true ]; then
+            echo -e "${GREEN}User requested stop. Exiting...${NC}"
+            break
+        fi
+
+        RUN_COUNT=$((RUN_COUNT + 1))
+        echo ""
+        echo -e "${GREEN}========================================${NC}"
+        echo -e "${GREEN}  Starting training run #$RUN_COUNT${NC}"
+        echo -e "${GREEN}========================================${NC}"
+
+        # Reset worker PIDs for this run
+        WORKER_PIDS=()
+
+        start_workers
+        monitor_workers
+        merge_checkpoints
+
+        if [ "$USER_EXIT_REQUESTED" = true ]; then
+            break
+        fi
+
+        echo -e "${BLUE}Run $RUN_COUNT completed. Starting next run in 3 seconds...${NC}"
+        sleep 3
+    done
+
+    echo ""
+    echo -e "${GREEN}Training session ended after $RUN_COUNT run(s)${NC}"
 }
 
 main "$@"
