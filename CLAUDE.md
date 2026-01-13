@@ -44,6 +44,13 @@ tensorboard --logdir runs/                 # Monitor
 python scripts/train.py --num-envs 12 --server-ports 8000 8001 8002
 ```
 
+**Multi-process training (bypasses GIL):**
+```bash
+# For better CPU utilization with multi-core systems
+./scripts/run_training_multiproc.sh --workers 4 --envs-per-worker 4
+# = 16 total envs across 4 Python processes, fully utilizing multiple CPU cores
+```
+
 ### OU Training
 ```bash
 # Joint training (recommended) - trains player + teambuilder together
@@ -80,7 +87,7 @@ uv run python scripts/coach_server.py
 
 | Area | Files |
 |------|-------|
-| Training | `scripts/train.py`, `scripts/train_ou.py` |
+| Training | `scripts/train.py`, `scripts/train_ou.py`, `scripts/train_multiproc.py` |
 | Network | `src/showdown_bot/models/network.py` |
 | PPO | `src/showdown_bot/training/ppo.py` |
 | Self-play | `src/showdown_bot/training/self_play.py` |
@@ -101,3 +108,4 @@ uv run python scripts/coach_server.py
 - Reward: win/loss + HP differential + KO bonus
 - Browser extension uses `world: "MAIN"` to access PS variables
 - Battle request at `app.curRoom.request` (not `.battle.request`)
+- Standard training is single-threaded due to Python's GIL; use `train_multiproc.py` for multi-core CPUs
