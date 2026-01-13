@@ -185,11 +185,9 @@ class OUPlayerNetwork(nn.Module):
         # Process field state
         field_h = self.field_proj(field_state)  # (B, hidden)
 
-        # Tera availability embedding
-        tera_avail = torch.tensor(
-            [0 if state.our_tera_used else 1],
-            device=device,
-        ).expand(batch_size)
+        # Tera availability embedding - avoid tensor creation in forward pass
+        tera_val = 0 if state.our_tera_used else 1
+        tera_avail = torch.full((batch_size,), tera_val, device=device, dtype=torch.long)
         tera_embed = self.tera_available_embed(tera_avail)  # (B, hidden//4)
 
         # Combine all features
@@ -279,6 +277,43 @@ class OUActorCritic(nn.Module):
         """Forward pass."""
         return self.network(state)
 
+    def _batch_states(
+        self, states: list[OUEncodedState]
+    ) -> OUEncodedState:
+        """Batch multiple states into a single batched state for efficient forward pass."""
+        batch_size = len(states)
+
+        # Stack all tensors
+        our_teams = torch.stack([s.our_team for s in states])
+        opp_revealed = torch.stack([s.opp_revealed for s in states])
+        opp_revealed_mask = torch.stack([s.opp_revealed_mask for s in states])
+        opp_predicted = torch.stack([s.opp_predicted for s in states])
+        field_states = torch.stack([s.field_state for s in states])
+        action_masks = torch.stack([s.action_mask for s in states])
+
+        # Collect scalar values as tensors for batched indexing
+        our_active_indices = [s.our_active_idx for s in states]
+
+        # Use first state's tera status for batch (they should be consistent within a batch)
+        # Or we could make this a tensor too if needed
+        our_tera_used = states[0].our_tera_used
+
+        return OUEncodedState(
+            our_team=our_teams,
+            our_active_idx=our_active_indices,  # List for batched indexing
+            opp_revealed=opp_revealed,
+            opp_revealed_mask=opp_revealed_mask,
+            opp_active_idx=states[0].opp_active_idx,  # Not used in forward
+            opp_predicted=opp_predicted,
+            field_state=field_states,
+            action_mask=action_masks,
+            our_tera_used=our_tera_used,
+            our_tera_type=states[0].our_tera_type,
+            opp_tera_used=states[0].opp_tera_used,
+            opp_tera_type=states[0].opp_tera_type,
+            turn_number=states[0].turn_number,
+        )
+
     def evaluate_actions(
         self,
         states: list[OUEncodedState],
@@ -293,28 +328,33 @@ class OUActorCritic(nn.Module):
         Returns:
             (log_probs, values, entropies)
         """
-        log_probs = []
-        values = []
-        entropies = []
+        if not states:
+            device = actions.device
+            return (
+                torch.tensor([], device=device),
+                torch.tensor([], device=device),
+                torch.tensor([], device=device),
+            )
 
-        for i, state in enumerate(states):
-            output = self.forward(state)
-            policy = output["policy"]
-            value = output["value"]
+        # Batch all states together for a single forward pass
+        batched_state = self._batch_states(states)
+        output = self.network(batched_state)
 
-            # Get log prob of taken action
-            action_idx = actions[i].item()
-            log_prob = torch.log(policy[0, action_idx] + 1e-8)
-            log_probs.append(log_prob)
+        policy = output["policy"]  # (batch, num_actions)
+        value = output["value"]  # (batch, 1)
 
-            values.append(value.squeeze())
+        batch_size = len(states)
 
-            # Entropy for exploration
-            entropy = -(policy * torch.log(policy + 1e-8)).sum()
-            entropies.append(entropy)
+        # Gather log probs for taken actions
+        # actions is (batch,), we need to index into policy
+        action_indices = actions.long().unsqueeze(-1)  # (batch, 1)
+        selected_probs = torch.gather(policy, dim=1, index=action_indices).squeeze(-1)
+        log_probs = torch.log(selected_probs + 1e-8)
 
-        return (
-            torch.stack(log_probs),
-            torch.stack(values),
-            torch.stack(entropies),
-        )
+        # Values - squeeze the last dimension
+        values = value.squeeze(-1)
+
+        # Entropy for exploration: -sum(p * log(p))
+        entropies = -(policy * torch.log(policy + 1e-8)).sum(dim=-1)
+
+        return log_probs, values, entropies

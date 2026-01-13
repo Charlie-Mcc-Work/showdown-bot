@@ -287,6 +287,11 @@ class OUTrainingManager:
         self.total_episodes = 0
         self.should_stop = False
 
+        # Pre-created players for reuse (created lazily in train())
+        self._players: list[OUTrainablePlayer] = []
+        self._opponents: list = []
+        self._opponent_infos: list = []
+
         # Set up signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -295,6 +300,58 @@ class OUTrainingManager:
         """Handle shutdown signals gracefully."""
         logger.info("\nShutdown requested, finishing current episode...")
         self.should_stop = True
+
+    async def _create_players(self) -> None:
+        """Create players and opponents once for reuse across rollouts."""
+        import random
+
+        self._players = []
+        self._opponents = []
+        self._opponent_infos = []
+
+        for i in range(self.num_envs):
+            # Distribute players across servers round-robin
+            server_config = self.server_configs[i % len(self.server_configs)]
+
+            # Pick a random team for this player
+            team = random.choice(self.teams) if self.teams else None
+
+            player = OUTrainablePlayer(
+                network=self.network,
+                state_encoder=self.encoder,
+                device=self.device,
+                teams=self.teams,
+                current_team=team,
+                battle_format="gen9ou",
+                max_concurrent_battles=1,
+                server_configuration=server_config,
+            )
+            self._players.append(player)
+
+            # Get opponent from self-play manager or baseline
+            if self.self_play_manager:
+                opponent, opponent_info, opponent_type = self.self_play_manager.get_opponent(
+                    battle_format="gen9ou",
+                    server_configuration=server_config,
+                )
+                self._opponents.append(opponent)
+                self._opponent_infos.append((opponent_info, opponent_type))
+            else:
+                opponent = OUMaxDamagePlayer(
+                    teams=self.teams,
+                    battle_format="gen9ou",
+                    max_concurrent_battles=1,
+                    server_configuration=server_config,
+                )
+                self._opponent_infos.append((None, "maxdamage"))
+                self._opponents.append(opponent)
+
+    def _refresh_teams(self) -> None:
+        """Refresh teams for players before a new rollout."""
+        import random
+        for player in self._players:
+            if self.teams:
+                player.current_team = random.choice(self.teams)
 
     async def train(
         self,
@@ -338,6 +395,10 @@ class OUTrainingManager:
 
         last_eval = self.total_timesteps
         last_save = self.total_timesteps
+
+        # Create players ONCE at the start (big performance improvement)
+        await self._create_players()
+        logger.info(f"Created {len(self._players)} reusable player connections")
 
         try:
             while self.total_timesteps < target_timesteps and not self.should_stop:
@@ -405,13 +466,16 @@ class OUTrainingManager:
                     display.message(f"Saved checkpoint at step {self.total_timesteps:,}")
                     last_save = self.total_timesteps
 
-                # Memory cleanup
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Memory cleanup (less frequent since we reuse players)
+                if self.total_timesteps % 1000 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         finally:
             display.close()
+            # Clean up players at the end (not after every rollout)
+            await self._cleanup_players(self._players + self._opponents, timeout=10.0)
 
         # Final save and summary
         self._save_checkpoint(final=True)
@@ -423,8 +487,67 @@ class OUTrainingManager:
         print(f"Final skill: {best_skill:.0f}")
         print("=" * 60)
 
+    async def _run_battle(
+        self,
+        player: OUTrainablePlayer,
+        opponent,
+        opponent_info,
+        opponent_type: str,
+    ) -> tuple[int, bool, list[dict]]:
+        """Run a single battle and return results.
+
+        Returns:
+            (steps, won, experiences)
+        """
+        import random
+        if self.teams:
+            player.current_team = random.choice(self.teams)
+
+        await player.battle_against(opponent, n_battles=1)
+
+        if not player.battles:
+            return 0, False, []
+
+        battle = list(player.battles.values())[-1]
+        won = battle.won if battle.won is not None else False
+        battle_steps = max(battle.turn, 1)
+
+        # Update skill rating
+        self.trainer.update_skill_rating(won, 1000.0)
+
+        # Update self-play stats
+        if self.self_play_manager:
+            self.self_play_manager.update_after_game(
+                opponent_info, won, opponent_type
+            )
+
+        # Get experiences with next_state computed
+        raw_experiences = player.get_experiences()
+        experiences = []
+        for j, exp in enumerate(raw_experiences):
+            next_state = None
+            if j < len(raw_experiences) - 1:
+                next_state = raw_experiences[j + 1]["state"]
+
+            experiences.append({
+                "state": exp["state"],
+                "action": exp["action"],
+                "reward": exp["reward"],
+                "next_state": next_state,
+                "done": exp["done"],
+                "log_prob": exp["log_prob"],
+                "value": exp["value"],
+                "team": exp.get("team"),
+            })
+
+        return battle_steps, won, experiences
+
     async def _collect_rollout(self) -> tuple[int, int]:
-        """Collect experience from battles.
+        """Collect experience from parallel battles.
+
+        Runs all environments in parallel with asyncio.gather, then adds
+        complete episodes to the buffer sequentially to preserve episode
+        boundaries for proper GAE computation.
 
         Returns:
             (steps_collected, episodes_completed)
@@ -432,132 +555,46 @@ class OUTrainingManager:
         steps = 0
         episodes = 0
 
-        # Create players for this rollout
-        players: list[OUTrainablePlayer] = []
-        opponents = []
-        opponent_infos = []  # Track self-play opponent info for rating updates
-
-        import random
+        # Run all battles in parallel
+        battle_tasks = []
         for i in range(self.num_envs):
-            # Distribute players across servers round-robin
-            server_config = self.server_configs[i % len(self.server_configs)]
-
-            # Pick a random team for this player
-            team = random.choice(self.teams) if self.teams else None
-
-            player = OUTrainablePlayer(
-                network=self.network,
-                state_encoder=self.encoder,
-                device=self.device,
-                teams=self.teams,
-                current_team=team,
-                battle_format="gen9ou",
-                max_concurrent_battles=1,
-                server_configuration=server_config,
+            player = self._players[i]
+            opponent = self._opponents[i]
+            opponent_info, opponent_type = self._opponent_infos[i]
+            task = asyncio.create_task(
+                self._run_battle(player, opponent, opponent_info, opponent_type)
             )
-            players.append(player)
+            battle_tasks.append(task)
 
-            # Get opponent from self-play manager or baseline
-            if self.self_play_manager:
-                opponent, opponent_info, opponent_type = self.self_play_manager.get_opponent(
-                    battle_format="gen9ou",
-                    server_configuration=server_config,
+        results = await asyncio.gather(*battle_tasks, return_exceptions=True)
+
+        # Add experiences episode by episode (preserves episode boundaries)
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(f"Battle error: {result}")
+                continue
+
+            battle_steps, won, experiences = result
+            if not experiences:
+                continue
+
+            # Add entire episode to buffer
+            for exp in experiences:
+                self.trainer.add_transition(
+                    state=exp["state"],
+                    action=exp["action"],
+                    reward=exp["reward"],
+                    next_state=exp["next_state"],
+                    done=exp["done"],
+                    log_prob=exp["log_prob"],
+                    value=exp["value"],
+                    team=exp.get("team"),
                 )
-                opponents.append(opponent)
-                opponent_infos.append((opponent_info, opponent_type))
-            else:
-                # Fallback: Use OUMaxDamagePlayer (gen9ou requires teams)
-                # RandomPlayer doesn't support teams, so we use maxdamage for both
-                opponent = OUMaxDamagePlayer(
-                    teams=self.teams,
-                    battle_format="gen9ou",
-                    max_concurrent_battles=1,
-                    server_configuration=server_config,
-                )
-                opponent_infos.append((None, "maxdamage"))
-                opponents.append(opponent)
 
-        try:
-            # Run battles concurrently
-            battle_tasks = []
-            for player, opponent in zip(players, opponents):
-                task = asyncio.create_task(
-                    self._run_battle(player, opponent)
-                )
-                battle_tasks.append(task)
-
-            results = await asyncio.gather(*battle_tasks, return_exceptions=True)
-
-            # Process results and collect experiences
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.warning(f"Battle error: {result}")
-                    continue
-                battle_steps, won = result
-                steps += battle_steps
-                episodes += 1
-
-                # Update self-play stats
-                opponent_info, opponent_type = opponent_infos[i]
-                if self.self_play_manager:
-                    self.self_play_manager.update_after_game(
-                        opponent_info, won, opponent_type
-                    )
-
-                # Collect experiences from this player
-                player = players[i]
-                experiences = player.get_experiences()
-
-                for j, exp in enumerate(experiences):
-                    # Get next state (None if last in episode)
-                    next_state = None
-                    if j < len(experiences) - 1:
-                        next_state = experiences[j + 1]["state"]
-
-                    self.trainer.add_transition(
-                        state=exp["state"],
-                        action=exp["action"],
-                        reward=exp["reward"],
-                        next_state=next_state,
-                        done=exp["done"],
-                        log_prob=exp["log_prob"],
-                        value=exp["value"],
-                        team=exp.get("team"),
-                    )
-
-        finally:
-            # Cleanup players
-            await self._cleanup_players(players + opponents)
+            steps += len(experiences)
+            episodes += 1
 
         return steps, episodes
-
-    async def _run_battle(
-        self,
-        player: OUTrainablePlayer,
-        opponent,
-    ) -> tuple[int, bool]:
-        """Run a single battle and collect experience.
-
-        The OUTrainablePlayer automatically collects experiences during
-        choose_move() and handles terminal rewards in _battle_finished_callback().
-
-        Returns:
-            (steps, won)
-        """
-        # Start battle
-        await player.battle_against(opponent, n_battles=1)
-
-        # Get final battle for result
-        if not player.battles:
-            return 0, False
-
-        battle = list(player.battles.values())[-1]
-        won = battle.won if battle.won is not None else False
-
-        # Update trainer stats
-        self.trainer.update_skill_rating(won, 1000.0)
-
-        return max(battle.turn, 1), won
 
     async def _cleanup_players(self, players: list, timeout: float = 5.0) -> None:
         """Clean up player connections with timeout.
@@ -586,7 +623,7 @@ class OUTrainingManager:
                 )
             except asyncio.TimeoutError:
                 pass  # Continue with memory cleanup even if websockets hang
-            await asyncio.sleep(0.3)
+            # Removed the 0.3s sleep - not needed for final cleanup
 
         # Free memory
         for player in players:
@@ -1060,6 +1097,11 @@ class JointTrainingManager:
         self.total_episodes = 0
         self.should_stop = False
 
+        # Pre-created players for reuse (created lazily in train())
+        self._players: list[OUTrainablePlayer] = []
+        self._opponents: list = []
+        self._opponent_types: list[str] = []
+
         # Signal handlers
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -1068,6 +1110,54 @@ class JointTrainingManager:
         """Handle shutdown signals."""
         logger.info("\nShutdown requested, finishing current episode...")
         self.should_stop = True
+
+    async def _create_players(self) -> None:
+        """Create players and opponents once for reuse across rollouts."""
+        import random
+
+        self._players = []
+        self._opponents = []
+        self._opponent_types = []
+
+        for i in range(self.num_envs):
+            server_config = self.server_configs[i % len(self.server_configs)]
+
+            # Get team from joint trainer's pool
+            team = self.joint_trainer.get_training_team()
+            if team is None and self.sample_teams:
+                team = random.choice(self.sample_teams)
+
+            player = OUTrainablePlayer(
+                network=self.network,
+                state_encoder=self.encoder,
+                device=self.device,
+                teams=[team] if team else self.sample_teams,
+                current_team=team,
+                battle_format="gen9ou",
+                max_concurrent_battles=1,
+                server_configuration=server_config,
+            )
+            self._players.append(player)
+
+            # Create opponent
+            opponent = OUMaxDamagePlayer(
+                teams=self.sample_teams,
+                battle_format="gen9ou",
+                max_concurrent_battles=1,
+                server_configuration=server_config,
+            )
+            self._opponents.append(opponent)
+            self._opponent_types.append("maxdamage")
+
+    def _refresh_teams(self) -> None:
+        """Refresh teams for players before a new rollout."""
+        import random
+        for player in self._players:
+            team = self.joint_trainer.get_training_team()
+            if team is None and self.sample_teams:
+                team = random.choice(self.sample_teams)
+            if team:
+                player.current_team = team
 
     async def train(
         self,
@@ -1107,6 +1197,10 @@ class JointTrainingManager:
 
         last_eval = self.total_timesteps
         last_save = self.total_timesteps
+
+        # Create players ONCE at the start (big performance improvement)
+        await self._create_players()
+        logger.info(f"Created {len(self._players)} reusable player connections")
 
         try:
             while self.total_timesteps < target_timesteps and not self.should_stop:
@@ -1152,13 +1246,16 @@ class JointTrainingManager:
                     display.message(f"Saved checkpoint at step {self.total_timesteps:,}")
                     last_save = self.total_timesteps
 
-                # Memory cleanup
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # Memory cleanup (less frequent since we reuse players)
+                if self.total_timesteps % 1000 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         finally:
             display.close()
+            # Clean up players at the end
+            await self._cleanup_players(self._players + self._opponents)
 
         # Final save and summary
         self._save_checkpoint(final=True)
@@ -1172,147 +1269,28 @@ class JointTrainingManager:
         print(f"Teams generated: {summary['teams_generated']}")
         print("=" * 60)
 
-    async def _collect_rollout(self) -> tuple[int, int]:
-        """Collect experience from battles using teams from the joint trainer.
-
-        Returns:
-            (steps_collected, episodes_completed)
-        """
-        steps = 0
-        episodes = 0
-
-        # Create players for this rollout
-        players: list[OUTrainablePlayer] = []
-        opponents = []
-        teams_used = []
-        opponent_types_used = []
-
-        import random
-        for i in range(self.num_envs):
-            # Distribute players across servers round-robin
-            server_config = self.server_configs[i % len(self.server_configs)]
-
-            # Get team from joint trainer's pool (uses curriculum)
-            team = self.joint_trainer.get_training_team()
-            if team is None:
-                # Fallback to sample teams
-                if self.sample_teams:
-                    team = random.choice(self.sample_teams)
-                else:
-                    continue
-
-            teams_used.append(team)
-
-            player = OUTrainablePlayer(
-                network=self.network,
-                state_encoder=self.encoder,
-                device=self.device,
-                teams=[team],
-                current_team=team,
-                battle_format="gen9ou",
-                max_concurrent_battles=1,
-                server_configuration=server_config,
-            )
-            players.append(player)
-
-            # Use curriculum to select opponent type
-            opponent_type = self.joint_trainer.get_opponent_type()
-            opponent_types_used.append(opponent_type.value)
-
-            # Note: gen9ou requires teams, so we use OUMaxDamagePlayer for all opponent types
-            # (RandomPlayer doesn't support teams)
-            if opponent_type == OpponentType.RANDOM or opponent_type == OpponentType.MAXDAMAGE:
-                opponent = OUMaxDamagePlayer(
-                    teams=self.sample_teams,
-                    battle_format="gen9ou",
-                    max_concurrent_battles=1,
-                    server_configuration=server_config,
-                )
-            else:
-                # SELF_PLAY and others: use maxdamage as placeholder
-                # TODO: Add self-play support for joint training
-                opponent = OUMaxDamagePlayer(
-                    teams=self.sample_teams,
-                    battle_format="gen9ou",
-                    max_concurrent_battles=1,
-                    server_configuration=server_config,
-                )
-            opponents.append(opponent)
-
-        if not players:
-            return 0, 0
-
-        try:
-            # Run battles concurrently
-            battle_tasks = []
-            for player, opponent in zip(players, opponents):
-                task = asyncio.create_task(self._run_battle(player, opponent))
-                battle_tasks.append(task)
-
-            results = await asyncio.gather(*battle_tasks, return_exceptions=True)
-
-            # Process results and collect experiences
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.warning(f"Battle error: {result}")
-                    continue
-
-                battle_steps, won, turns, opponent_revealed = result
-                steps += battle_steps
-                episodes += 1
-
-                # Record battle outcome in joint trainer
-                team = teams_used[i]
-                opponent_type = opponent_types_used[i]
-                self.joint_trainer.record_battle_outcome(
-                    team=team,
-                    won=won,
-                    turns=turns,
-                    opponent_revealed=opponent_revealed,
-                    opponent_rating=1000.0,  # Baseline opponents
-                    opponent_type=opponent_type,
-                )
-
-                # Collect experiences from player
-                player = players[i]
-                experiences = player.get_experiences()
-
-                for j, exp in enumerate(experiences):
-                    next_state = None
-                    if j < len(experiences) - 1:
-                        next_state = experiences[j + 1]["state"]
-
-                    self.joint_trainer.player_trainer.add_transition(
-                        state=exp["state"],
-                        action=exp["action"],
-                        reward=exp["reward"],
-                        next_state=next_state,
-                        done=exp["done"],
-                        log_prob=exp["log_prob"],
-                        value=exp["value"],
-                        team=exp.get("team"),
-                    )
-
-        finally:
-            # Cleanup players
-            await self._cleanup_players(players + opponents)
-
-        return steps, episodes
-
     async def _run_battle(
         self,
         player: OUTrainablePlayer,
         opponent,
-    ) -> tuple[int, bool, int, list[str]]:
-        """Run a single battle.
+        opponent_type: str,
+    ) -> tuple[int, bool, int, list[str], list[dict], any]:
+        """Run a single battle and return results.
 
         Returns:
-            (steps, won, turns, opponent_revealed)
+            (steps, won, turns, opponent_revealed, experiences, team)
         """
+        import random
+        team = self.joint_trainer.get_training_team()
+        if team is None and self.sample_teams:
+            team = random.choice(self.sample_teams)
+        if team:
+            player.current_team = team
+
         await player.battle_against(opponent, n_battles=1)
 
         if not player.battles:
-            return 0, False, 0, []
+            return 0, False, 0, [], [], team
 
         battle = list(player.battles.values())[-1]
         won = battle.won if battle.won is not None else False
@@ -1325,7 +1303,91 @@ class JointTrainingManager:
                 mon.species for mon in battle.opponent_team.values()
             ]
 
-        return turns, won, turns, opponent_revealed
+        # Get experiences with next_state computed
+        raw_experiences = player.get_experiences()
+        experiences = []
+        for j, exp in enumerate(raw_experiences):
+            next_state = None
+            if j < len(raw_experiences) - 1:
+                next_state = raw_experiences[j + 1]["state"]
+
+            experiences.append({
+                "state": exp["state"],
+                "action": exp["action"],
+                "reward": exp["reward"],
+                "next_state": next_state,
+                "done": exp["done"],
+                "log_prob": exp["log_prob"],
+                "value": exp["value"],
+                "team": exp.get("team"),
+            })
+
+        return turns, won, turns, opponent_revealed, experiences, team
+
+    async def _collect_rollout(self) -> tuple[int, int]:
+        """Collect experience from parallel battles.
+
+        Runs all environments in parallel with asyncio.gather, then adds
+        complete episodes to the buffer sequentially to preserve episode
+        boundaries for proper GAE computation.
+
+        Returns:
+            (steps_collected, episodes_completed)
+        """
+        steps = 0
+        episodes = 0
+
+        # Run all battles in parallel
+        battle_tasks = []
+        for i in range(self.num_envs):
+            player = self._players[i]
+            opponent = self._opponents[i]
+            opponent_type = self._opponent_types[i]
+            task = asyncio.create_task(
+                self._run_battle(player, opponent, opponent_type)
+            )
+            battle_tasks.append(task)
+
+        results = await asyncio.gather(*battle_tasks, return_exceptions=True)
+
+        # Add experiences episode by episode (preserves episode boundaries)
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.warning(f"Battle error: {result}")
+                continue
+
+            battle_steps, won, turns, opponent_revealed, experiences, team = result
+            if not experiences:
+                continue
+
+            # Record battle outcome in joint trainer
+            opponent_type = self._opponent_types[i]
+            self.joint_trainer.record_battle_outcome(
+                team=team,
+                won=won,
+                turns=turns,
+                opponent_revealed=opponent_revealed,
+                opponent_rating=1000.0,
+                opponent_type=opponent_type,
+            )
+
+            # Add entire episode to buffer
+            for exp in experiences:
+                self.joint_trainer.player_trainer.add_transition(
+                    state=exp["state"],
+                    action=exp["action"],
+                    reward=exp["reward"],
+                    next_state=exp["next_state"],
+                    done=exp["done"],
+                    log_prob=exp["log_prob"],
+                    value=exp["value"],
+                    team=exp.get("team"),
+                )
+
+            steps += len(experiences)
+            episodes += 1
+
+        return steps, episodes
 
     async def _cleanup_players(self, players: list, timeout: float = 5.0) -> None:
         """Clean up player connections with timeout.
@@ -1354,7 +1416,7 @@ class JointTrainingManager:
                 )
             except asyncio.TimeoutError:
                 pass  # Continue with memory cleanup even if websockets hang
-            await asyncio.sleep(0.3)
+            # Removed the 0.3s sleep - not needed for final cleanup
 
         for player in players:
             if hasattr(player, 'network'):

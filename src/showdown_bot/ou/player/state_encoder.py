@@ -12,10 +12,32 @@ from typing import Any
 
 import numpy as np
 import torch
-from poke_env.battle import AbstractBattle
+from poke_env.battle import AbstractBattle, Field, SideCondition, Weather
 
 from showdown_bot.ou.shared.embeddings import SharedEmbeddings
 from showdown_bot.ou.shared.data_loader import PokemonDataLoader, UsageStatsLoader
+
+
+# Pre-defined mappings for efficient lookup (avoid string operations)
+WEATHER_TO_IDX = {
+    Weather.SUNNYDAY: 0, Weather.RAINDANCE: 1, Weather.SANDSTORM: 2,
+    Weather.HAIL: 3, Weather.SNOW: 3, Weather.DESOLATELAND: 0,
+    Weather.PRIMORDIALSEA: 1, Weather.DELTASTREAM: 4,
+}
+TERRAIN_TO_IDX = {
+    Field.ELECTRIC_TERRAIN: 0, Field.GRASSY_TERRAIN: 1,
+    Field.MISTY_TERRAIN: 2, Field.PSYCHIC_TERRAIN: 3,
+}
+# Status mapping
+STATUS_TO_IDX = {"brn": 0, "frz": 1, "par": 2, "psn": 3, "slp": 4, "tox": 5}
+
+# Type mapping (cached for fast lookup)
+TYPE_TO_IDX = {
+    "normal": 1, "fire": 2, "water": 3, "electric": 4, "grass": 5, "ice": 6,
+    "fighting": 7, "poison": 8, "ground": 9, "flying": 10, "psychic": 11,
+    "bug": 12, "rock": 13, "ghost": 14, "dragon": 15, "dark": 16, "steel": 17,
+    "fairy": 18,
+}
 
 
 @dataclass
@@ -107,6 +129,14 @@ class OUStateEncoder:
         # Our team (set before battle)
         self.our_team_data: list[dict[str, Any]] = []
 
+        # Cache species_to_id mapping for fast lookup (load once)
+        self.data_loader.load()
+        self._species_id_cache = self.data_loader.species_to_id
+
+        # Pre-allocate reusable arrays to reduce allocations
+        self._zeros_pokemon = np.zeros((6, self.POKEMON_FEATURES), dtype=np.float32)
+        self._zeros_field = np.zeros(self.FIELD_FEATURES, dtype=np.float32)
+
     def set_our_team(self, team_data: list[dict[str, Any]]) -> None:
         """Set our team data before the battle.
 
@@ -168,14 +198,15 @@ class OUStateEncoder:
 
         Unlike random battles, we have full knowledge of our team.
         """
-        team_encoding = torch.zeros(6, self.POKEMON_FEATURES)
+        # Pre-allocate numpy array
+        team_encoding = np.zeros((6, self.POKEMON_FEATURES), dtype=np.float32)
 
         for i, pokemon in enumerate(battle.team.values()):
             if i >= 6:
                 break
             team_encoding[i] = self._encode_pokemon(pokemon, full_knowledge=True)
 
-        return team_encoding
+        return torch.from_numpy(team_encoding)
 
     def _encode_opponent_revealed(
         self, battle: AbstractBattle
@@ -185,8 +216,9 @@ class OUStateEncoder:
         Returns:
             (encodings, mask) where mask is True for revealed Pokemon
         """
-        revealed_encoding = torch.zeros(6, self.POKEMON_FEATURES)
-        mask = torch.zeros(6, dtype=torch.bool)
+        # Pre-allocate numpy arrays
+        revealed_encoding = np.zeros((6, self.POKEMON_FEATURES), dtype=np.float32)
+        mask = np.zeros(6, dtype=np.bool_)
 
         for i, pokemon in enumerate(battle.opponent_team.values()):
             if i >= 6:
@@ -194,7 +226,7 @@ class OUStateEncoder:
             revealed_encoding[i] = self._encode_pokemon(pokemon, full_knowledge=False)
             mask[i] = True
 
-        return revealed_encoding, mask
+        return torch.from_numpy(revealed_encoding), torch.from_numpy(mask)
 
     def _predict_opponent_unrevealed(
         self,
@@ -203,24 +235,18 @@ class OUStateEncoder:
     ) -> torch.Tensor:
         """Predict unrevealed opponent Pokemon using usage stats.
 
-        Uses:
-        - Revealed teammates to predict common partners
-        - Overall usage stats for the tier
+        NOTE: Currently returns zeros - prediction not yet implemented.
+        For efficiency, this returns a pre-allocated tensor.
         """
-        predicted = torch.zeros(6, self.POKEMON_FEATURES)
-
-        # TODO: Implement actual prediction based on:
-        # 1. Revealed Pokemon's common teammates
-        # 2. Team archetype detection
-        # 3. Usage rate priors
-
-        return predicted
+        # Return zeros tensor directly - no need to allocate new array
+        # TODO: Implement actual prediction when ready
+        return torch.zeros(6, self.POKEMON_FEATURES)
 
     def _encode_pokemon(
         self,
         pokemon: Any,  # poke_env Pokemon object
         full_knowledge: bool = False,
-    ) -> torch.Tensor:
+    ) -> np.ndarray:
         """Encode a single Pokemon.
 
         Args:
@@ -229,45 +255,52 @@ class OUStateEncoder:
                           only use revealed info (opponent Pokemon).
 
         Returns:
-            (POKEMON_FEATURES,) tensor
+            (POKEMON_FEATURES,) numpy array
         """
-        features = []
+        # Pre-allocate array for efficiency
+        features = np.zeros(self.POKEMON_FEATURES, dtype=np.float32)
+        idx = 0
 
-        # Species (one-hot or embedding lookup)
-        species_id = self.data_loader.get_species_id(pokemon.species)
-        # For now, just use a normalized ID as placeholder
-        features.append(species_id / 1000.0)
+        # Species ID (normalized) - use cached species_to_id dict directly
+        species_key = pokemon.species.lower().replace(" ", "")
+        species_id = self._species_id_cache.get(species_key, 0)
+        features[idx] = species_id / 1000.0
+        idx += 1
 
         # HP
-        features.append(pokemon.current_hp_fraction)
+        features[idx] = pokemon.current_hp_fraction
+        idx += 1
 
-        # Status
-        status_vec = [0.0] * 7  # BRN, FRZ, PAR, PSN, SLP, TOX, healthy
+        # Status (7 slots: BRN, FRZ, PAR, PSN, SLP, TOX, healthy)
         if pokemon.status:
-            status_map = {"brn": 0, "frz": 1, "par": 2, "psn": 3, "slp": 4, "tox": 5}
-            if pokemon.status.name.lower() in status_map:
-                status_vec[status_map[pokemon.status.name.lower()]] = 1.0
+            status_name = pokemon.status.name.lower()
+            if status_name in STATUS_TO_IDX:
+                features[idx + STATUS_TO_IDX[status_name]] = 1.0
         else:
-            status_vec[6] = 1.0
-        features.extend(status_vec)
+            features[idx + 6] = 1.0  # Healthy
+        idx += 7
 
-        # Boosts
-        boost_order = ["atk", "def", "spa", "spd", "spe", "accuracy", "evasion"]
-        for stat in boost_order:
-            boost = pokemon.boosts.get(stat, 0)
-            features.append(boost / 6.0)
+        # Boosts (7 stats)
+        boosts = pokemon.boosts
+        features[idx] = boosts.get("atk", 0) / 6.0
+        features[idx + 1] = boosts.get("def", 0) / 6.0
+        features[idx + 2] = boosts.get("spa", 0) / 6.0
+        features[idx + 3] = boosts.get("spd", 0) / 6.0
+        features[idx + 4] = boosts.get("spe", 0) / 6.0
+        features[idx + 5] = boosts.get("accuracy", 0) / 6.0
+        features[idx + 6] = boosts.get("evasion", 0) / 6.0
+        idx += 7
 
-        # Types
-        type1_id = self.data_loader.get_type_id(str(pokemon.type_1))
-        type2_id = self.data_loader.get_type_id(str(pokemon.type_2)) if pokemon.type_2 else 0
-        features.append(type1_id / 18.0)
-        features.append(type2_id / 18.0)
+        # Types (use direct lookup from module-level dict)
+        if pokemon.type_1:
+            type1_name = pokemon.type_1.name.lower()
+            features[idx] = TYPE_TO_IDX.get(type1_name, 0) / 18.0
+        if pokemon.type_2:
+            type2_name = pokemon.type_2.name.lower()
+            features[idx + 1] = TYPE_TO_IDX.get(type2_name, 0) / 18.0
+        # idx += 2 (remaining features are zeros - padding)
 
-        # Pad or truncate to POKEMON_FEATURES
-        while len(features) < self.POKEMON_FEATURES:
-            features.append(0.0)
-
-        return torch.tensor(features[:self.POKEMON_FEATURES], dtype=torch.float32)
+        return features
 
     def _get_active_index(
         self, battle: AbstractBattle, is_opponent: bool = False
@@ -283,75 +316,69 @@ class OUStateEncoder:
 
     def _encode_field(self, battle: AbstractBattle) -> torch.Tensor:
         """Encode field state (weather, terrain, hazards, etc.)."""
-        features = []
+        # Pre-allocate numpy array for speed
+        features = np.zeros(self.FIELD_FEATURES, dtype=np.float32)
+        idx = 0
 
-        # Weather (5 types + none)
-        weather_vec = [0.0] * 6
+        # Weather (5 types + none = 6 slots)
         if battle.weather:
-            weather_map = {
-                "sunnyday": 0, "raindance": 1, "sandstorm": 2,
-                "hail": 3, "snow": 3, "desolateland": 0,
-                "primordialsea": 1, "deltastream": 4,
-            }
             for w in battle.weather:
-                w_lower = str(w).lower()
-                if w_lower in weather_map:
-                    weather_vec[weather_map[w_lower]] = 1.0
+                if w in WEATHER_TO_IDX:
+                    features[idx + WEATHER_TO_IDX[w]] = 1.0
+                    break
         else:
-            weather_vec[5] = 1.0
-        features.extend(weather_vec)
+            features[idx + 5] = 1.0  # No weather
+        idx += 6
 
-        # Terrain (5 types + none)
-        terrain_vec = [0.0] * 5
+        # Terrain (4 types + none = 5 slots)
+        terrain_set = False
         if battle.fields:
-            terrain_map = {
-                "electricterrain": 0, "grassyterrain": 1,
-                "mistyterrain": 2, "psychicterrain": 3,
-            }
             for f in battle.fields:
-                f_lower = str(f).lower()
-                if f_lower in terrain_map:
-                    terrain_vec[terrain_map[f_lower]] = 1.0
-        else:
-            terrain_vec[4] = 1.0
-        features.extend(terrain_vec)
+                if f in TERRAIN_TO_IDX:
+                    features[idx + TERRAIN_TO_IDX[f]] = 1.0
+                    terrain_set = True
+                    break
+        if not terrain_set:
+            features[idx + 4] = 1.0  # No terrain
+        idx += 5
 
-        # Our side hazards
+        # Our side conditions (using enum lookups)
         side = battle.side_conditions
-        features.append(1.0 if "spikes" in str(side).lower() else 0.0)
-        features.append(1.0 if "stealthrock" in str(side).lower() else 0.0)
-        features.append(1.0 if "toxicspikes" in str(side).lower() else 0.0)
-        features.append(1.0 if "stickyweb" in str(side).lower() else 0.0)
+        features[idx] = 1.0 if SideCondition.SPIKES in side else 0.0
+        features[idx + 1] = 1.0 if SideCondition.STEALTH_ROCK in side else 0.0
+        features[idx + 2] = 1.0 if SideCondition.TOXIC_SPIKES in side else 0.0
+        features[idx + 3] = 1.0 if SideCondition.STICKY_WEB in side else 0.0
+        idx += 4
 
         # Opponent side hazards
         opp_side = battle.opponent_side_conditions
-        features.append(1.0 if "spikes" in str(opp_side).lower() else 0.0)
-        features.append(1.0 if "stealthrock" in str(opp_side).lower() else 0.0)
-        features.append(1.0 if "toxicspikes" in str(opp_side).lower() else 0.0)
-        features.append(1.0 if "stickyweb" in str(opp_side).lower() else 0.0)
+        features[idx] = 1.0 if SideCondition.SPIKES in opp_side else 0.0
+        features[idx + 1] = 1.0 if SideCondition.STEALTH_ROCK in opp_side else 0.0
+        features[idx + 2] = 1.0 if SideCondition.TOXIC_SPIKES in opp_side else 0.0
+        features[idx + 3] = 1.0 if SideCondition.STICKY_WEB in opp_side else 0.0
+        idx += 4
 
-        # Screens
-        features.append(1.0 if "reflect" in str(side).lower() else 0.0)
-        features.append(1.0 if "lightscreen" in str(side).lower() else 0.0)
-        features.append(1.0 if "auroraveil" in str(side).lower() else 0.0)
+        # Screens (our side)
+        features[idx] = 1.0 if SideCondition.REFLECT in side else 0.0
+        features[idx + 1] = 1.0 if SideCondition.LIGHT_SCREEN in side else 0.0
+        features[idx + 2] = 1.0 if SideCondition.AURORA_VEIL in side else 0.0
+        idx += 3
 
         # Opponent screens
-        features.append(1.0 if "reflect" in str(opp_side).lower() else 0.0)
-        features.append(1.0 if "lightscreen" in str(opp_side).lower() else 0.0)
-        features.append(1.0 if "auroraveil" in str(opp_side).lower() else 0.0)
+        features[idx] = 1.0 if SideCondition.REFLECT in opp_side else 0.0
+        features[idx + 1] = 1.0 if SideCondition.LIGHT_SCREEN in opp_side else 0.0
+        features[idx + 2] = 1.0 if SideCondition.AURORA_VEIL in opp_side else 0.0
+        idx += 3
 
         # Trick room
-        features.append(1.0 if battle.fields and "trickroom" in str(battle.fields).lower() else 0.0)
+        features[idx] = 1.0 if Field.TRICK_ROOM in battle.fields else 0.0
+        idx += 1
 
         # Tailwind
-        features.append(1.0 if "tailwind" in str(side).lower() else 0.0)
-        features.append(1.0 if "tailwind" in str(opp_side).lower() else 0.0)
+        features[idx] = 1.0 if SideCondition.TAILWIND in side else 0.0
+        features[idx + 1] = 1.0 if SideCondition.TAILWIND in opp_side else 0.0
 
-        # Pad to FIELD_FEATURES
-        while len(features) < self.FIELD_FEATURES:
-            features.append(0.0)
-
-        return torch.tensor(features[:self.FIELD_FEATURES], dtype=torch.float32)
+        return torch.from_numpy(features)
 
     def _create_action_mask(self, battle: AbstractBattle) -> torch.Tensor:
         """Create mask for legal actions.
@@ -361,7 +388,8 @@ class OUStateEncoder:
         - 4-7: Tera moves (same moves but with Tera)
         - 8-12: Switch to Pokemon 0-4
         """
-        mask = torch.zeros(self.NUM_ACTIONS, dtype=torch.float32)
+        # Use numpy for efficiency
+        mask = np.zeros(self.NUM_ACTIONS, dtype=np.float32)
 
         # Handle forced switch
         if battle.force_switch:
@@ -375,12 +403,12 @@ class OUStateEncoder:
                         mask[8 + idx] = 1.0
         else:
             # Regular turn - moves are available
-            for i, move in enumerate(battle.available_moves[:4]):
-                mask[i] = 1.0
+            num_moves = min(len(battle.available_moves), 4)
+            mask[:num_moves] = 1.0
 
-                # Tera moves available if we can tera
-                if battle.can_tera:
-                    mask[4 + i] = 1.0
+            # Tera moves available if we can tera
+            if battle.can_tera:
+                mask[4:4 + num_moves] = 1.0
 
             # Switches
             available_switches = battle.available_switches
@@ -395,7 +423,7 @@ class OUStateEncoder:
         if mask.sum() == 0:
             mask[0] = 1.0
 
-        return mask
+        return torch.from_numpy(mask)
 
     def action_to_battle_order(
         self,

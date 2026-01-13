@@ -155,7 +155,10 @@ class OUExperienceBuffer:
         self,
         batch_size: int,
     ) -> tuple[list[OUTransition], list[float], list[float]]:
-        """Sample a batch of transitions.
+        """Sample a batch of transitions with computed returns.
+
+        Only samples from transitions that have returns/advantages computed
+        (i.e., from complete episodes).
 
         Args:
             batch_size: Number of transitions to sample
@@ -163,14 +166,19 @@ class OUExperienceBuffer:
         Returns:
             (transitions, returns, advantages)
         """
-        if len(self.transitions) < batch_size:
-            indices = list(range(len(self.transitions)))
+        # Only sample from transitions with computed returns
+        num_with_returns = len(self.returns) if self.returns else 0
+        if num_with_returns == 0:
+            return [], [], []
+
+        if num_with_returns < batch_size:
+            indices = list(range(num_with_returns))
         else:
-            indices = random.sample(range(len(self.transitions)), batch_size)
+            indices = random.sample(range(num_with_returns), batch_size)
 
         transitions = [self.transitions[i] for i in indices]
-        returns = [self.returns[i] for i in indices] if self.returns else [0.0] * len(indices)
-        advantages = [self.advantages[i] for i in indices] if self.advantages else [0.0] * len(indices)
+        returns = [self.returns[i] for i in indices]
+        advantages = [self.advantages[i] for i in indices]
 
         return transitions, returns, advantages
 
@@ -179,7 +187,11 @@ class OUExperienceBuffer:
         batch_size: int,
         shuffle: bool = True,
     ) -> Iterator[tuple[list[OUTransition], list[float], list[float]]]:
-        """Iterate over all transitions in batches.
+        """Iterate over transitions with computed returns in batches.
+
+        Only iterates over transitions that have returns/advantages computed
+        (i.e., from complete episodes). Incomplete episodes at the end of
+        the buffer are skipped.
 
         Args:
             batch_size: Batch size
@@ -188,7 +200,13 @@ class OUExperienceBuffer:
         Yields:
             (transitions, returns, advantages) batches
         """
-        indices = list(range(len(self.transitions)))
+        # Only iterate over transitions with computed returns
+        # (incomplete episodes at the end won't have returns)
+        num_with_returns = len(self.returns) if self.returns else 0
+        if num_with_returns == 0:
+            return
+
+        indices = list(range(num_with_returns))
         if shuffle:
             random.shuffle(indices)
 
@@ -197,8 +215,8 @@ class OUExperienceBuffer:
             batch_indices = indices[start:end]
 
             transitions = [self.transitions[i] for i in batch_indices]
-            returns = [self.returns[i] for i in batch_indices] if self.returns else [0.0] * len(batch_indices)
-            advantages = [self.advantages[i] for i in batch_indices] if self.advantages else [0.0] * len(batch_indices)
+            returns = [self.returns[i] for i in batch_indices]
+            advantages = [self.advantages[i] for i in batch_indices]
 
             yield transitions, returns, advantages
 
