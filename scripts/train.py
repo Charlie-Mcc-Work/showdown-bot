@@ -63,7 +63,11 @@ def find_latest_checkpoint(save_dir: str) -> Path | None:
 
 async def train(args: argparse.Namespace) -> None:
     """Main training function."""
-    device = get_device()
+    if args.device == "auto":
+        device = get_device()
+    else:
+        device = torch.device(args.device)
+        print(f"Using {args.device.upper()}")
 
     # Create model
     print("\nInitializing neural network...")
@@ -196,6 +200,13 @@ def main() -> None:
         default=None,
         help="Pokemon Showdown server ports (e.g., --server-ports 8000 8001 8002). "
              "Environments are distributed across servers round-robin.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "cpu"],
+        help="Device to use for training (auto, cuda, cpu)",
     )
 
     args = parser.parse_args()

@@ -275,7 +275,8 @@ class PolicyValueNetwork(nn.Module):
             entropy: Policy entropy (batch,)
             value: State value (batch,)
         """
-        logits, value = self.forward(
+        # Use self() instead of self.forward() for DDP compatibility
+        logits, value = self(
             player_pokemon,
             opponent_pokemon,
             player_active_idx,

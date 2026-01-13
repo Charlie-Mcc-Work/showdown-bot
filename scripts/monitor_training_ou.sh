@@ -1,6 +1,6 @@
 #!/bin/bash
 # Monitor all parallel OU training workers and show combined stats
-# Works with logs from run_training_ou_parallel.sh
+# Works with logs from run_training_ou.sh
 
 # Colors
 BLUE='\033[0;34m'
@@ -29,57 +29,58 @@ while true; do
 
     # Aggregate stats from all workers
     total_steps=0
-    total_episodes=0
     total_speed=0
-    total_win=0
+    total_wins=0
+    total_games=0
     best_skill=0
     active_workers=0
 
     for log in logs/ou_worker_*.log; do
-        # Get recent lines to find the latest progress update
-        # OU logs use format: "Step 1,234 | Episodes: 56 | Win rate: 75.0% | Skill: 1200 | ..."
-        line=$(grep -E "Step [0-9,]+ \|" "$log" 2>/dev/null | tail -1)
+        # Get the last line, strip ANSI codes and carriage returns
+        line=$(tail -1 "$log" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g; s/\][^]]*\\//g; s/\r//g')
 
-        if [ -n "$line" ]; then
+        # Check if it's a progress line (contains [--- or [=== pattern and /s)
+        if echo "$line" | grep -qE '\[[-=]+\].*[0-9]+/s'; then
             active_workers=$((active_workers + 1))
 
-            # Extract step count (e.g., "Step 1,234,567")
-            steps=$(echo "$line" | grep -oP 'Step [0-9,]+' | head -1 | grep -oP '[0-9,]+' | tr -d ',')
-            if [ -n "$steps" ]; then
-                total_steps=$((total_steps + steps))
+            # Extract current steps (e.g., "200" or "1.5K" or "7.5M" before the /)
+            # Format: 200/5.00M or 1.5K/5.00M or 7.5M/5.00M
+            steps_str=$(echo "$line" | sed -n 's/.*\] *\([0-9.]*[KM]*\)\/.*/\1/p')
+            if [ -n "$steps_str" ]; then
+                if [[ "$steps_str" == *M ]]; then
+                    steps=$(echo "${steps_str%M} * 1000000" | bc 2>/dev/null | cut -d. -f1)
+                elif [[ "$steps_str" == *K ]]; then
+                    steps=$(echo "${steps_str%K} * 1000" | bc 2>/dev/null | cut -d. -f1)
+                else
+                    steps="$steps_str"
+                fi
+                [ -n "$steps" ] && [ "$steps" -eq "$steps" ] 2>/dev/null && total_steps=$((total_steps + steps))
             fi
 
-            # Extract episodes (e.g., "Episodes: 123")
-            episodes=$(echo "$line" | grep -oP 'Episodes: [0-9,]+' | head -1 | grep -oP '[0-9,]+' | tr -d ',')
-            if [ -n "$episodes" ]; then
-                total_episodes=$((total_episodes + episodes))
-            fi
-
-            # Extract win rate (e.g., "Win rate: 75.0%")
-            win=$(echo "$line" | grep -oP 'Win rate: [0-9.]+' | head -1 | grep -oP '[0-9.]+')
-            if [ -n "$win" ]; then
-                # Convert to integer percentage
-                win_int=$(echo "$win" | cut -d. -f1)
-                total_win=$((total_win + win_int))
-            fi
-
-            # Extract skill (e.g., "Skill: 1200")
-            skill=$(echo "$line" | grep -oP 'Skill: [0-9]+' | head -1 | grep -oP '[0-9]+')
-            if [ -n "$skill" ] && [ "$skill" -gt "$best_skill" ]; then
-                best_skill=$skill
-            fi
-
-            # Extract speed (e.g., "Speed: 45.2 steps/s")
-            speed=$(echo "$line" | grep -oP 'Speed: [0-9.]+' | head -1 | grep -oP '[0-9.]+' | cut -d. -f1)
-            if [ -n "$speed" ]; then
+            # Extract speed (e.g., "22/s")
+            speed=$(echo "$line" | sed -n 's/.*| *\([0-9]*\)\/s.*/\1/p')
+            if [ -n "$speed" ] && [ "$speed" -eq "$speed" ] 2>/dev/null; then
                 total_speed=$((total_speed + speed))
+            fi
+
+            # Extract win rate (e.g., "Win: 0%" or "Win:85%")
+            win=$(echo "$line" | sed -n 's/.*Win: *\([0-9]*\)%.*/\1/p')
+            if [ -n "$win" ] && [ "$win" -eq "$win" ] 2>/dev/null; then
+                total_wins=$((total_wins + win))
+                total_games=$((total_games + 1))
+            fi
+
+            # Extract skill (e.g., "Skill:  914" or "Skill:30066")
+            skill=$(echo "$line" | sed -n 's/.*Skill: *\([0-9]*\).*/\1/p')
+            if [ -n "$skill" ] && [ "$skill" -eq "$skill" ] 2>/dev/null && [ "$skill" -gt "$best_skill" ]; then
+                best_skill=$skill
             fi
         fi
     done
 
     # Calculate averages
-    if [ $active_workers -gt 0 ]; then
-        avg_win=$((total_win / active_workers))
+    if [ $total_games -gt 0 ]; then
+        avg_win=$((total_wins / total_games))
     else
         avg_win=0
     fi
@@ -93,8 +94,8 @@ while true; do
         total_fmt=$total_steps
     fi
 
-    # Build progress bar (assume 10M total target for OU)
-    target=10000000
+    # Build progress bar (assume 20M total target for OU with multiple workers)
+    target=20000000
     if [ $total_steps -gt 0 ]; then
         pct=$((total_steps * 100 / target))
         if [ $pct -gt 100 ]; then pct=100; fi
@@ -120,8 +121,9 @@ while true; do
         eta="--"
     fi
 
-    # Display combined stats (percentage and ETA right after progress bar)
-    echo -ne "\r[${bar}${bar_empty}] ${pct}% | ETA:${eta} | ${total_fmt} | ${CYAN}${total_speed}/s${NC} | Workers:${active_workers}/${num_workers} | Win:${avg_win}% | Skill:${best_skill} | Ep:${total_episodes}    "
+    # Display combined stats
+    printf "\r[%s%s] %d%% | ETA:%s | %s | ${CYAN}%d/s${NC} | Workers:%d/%d | Win:%d%% | Skill:%d    " \
+        "$bar" "$bar_empty" "$pct" "$eta" "$total_fmt" "$total_speed" "$active_workers" "$num_workers" "$avg_win" "$best_skill"
 
     sleep 2
 done

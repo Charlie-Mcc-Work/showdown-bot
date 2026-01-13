@@ -121,7 +121,7 @@ Ability: Protosynthesis
 Tera Type: Fairy
 EVs: 252 HP / 252 SpA / 4 SpD
 Modest Nature
-IVs: 0 Atk
+IVs: 20 Atk
 - Thunderclap
 - Draco Meteor
 - Thunderbolt
@@ -202,7 +202,7 @@ Bold Nature
 IVs: 0 Atk
 - Lava Plume
 - Stealth Rock
-- Yawn
+- Will-O-Wisp
 - Rapid Spin
 
 Walking Wake @ Choice Specs
@@ -238,15 +238,15 @@ IVs: 0 Atk
 - Earth Power
 - Taunt
 
-Roaring Moon @ Booster Energy
-Ability: Protosynthesis
-Tera Type: Flying
+Dragonite @ Heavy-Duty Boots
+Ability: Multiscale
+Tera Type: Normal
 EVs: 252 Atk / 4 SpD / 252 Spe
-Jolly Nature
+Adamant Nature
 - Dragon Dance
-- Acrobatics
-- Knock Off
+- Extreme Speed
 - Earthquake
+- Roost
 
 Ting-Lu @ Leftovers
 Ability: Vessel of Ruin
@@ -258,70 +258,68 @@ Careful Nature
 - Whirlwind
 - Stealth Rock
 
-=== [gen9ou] Trick Room Team ===
+=== [gen9ou] Stall Team ===
 
-Ursaluna @ Flame Orb
-Ability: Guts
-Tera Type: Normal
-EVs: 252 HP / 252 Atk / 4 SpD
-Brave Nature
-IVs: 0 Spe
-- Facade
-- Earthquake
-- Headlong Rush
-- Protect
-
-Hatterene @ Life Orb
-Ability: Magic Bounce
-Tera Type: Fairy
-EVs: 252 HP / 252 SpA / 4 SpD
-Quiet Nature
-IVs: 0 Atk / 0 Spe
-- Trick Room
-- Psyshock
-- Dazzling Gleam
-- Mystical Fire
-
-Magearna @ Leftovers
-Ability: Soul-Heart
-Tera Type: Water
-EVs: 252 HP / 252 SpA / 4 SpD
-Quiet Nature
-IVs: 0 Atk / 0 Spe
-- Fleur Cannon
-- Flash Cannon
-- Aura Sphere
-- Trick Room
-
-Diancie @ Leftovers
-Ability: Clear Body
-Tera Type: Steel
-EVs: 252 HP / 4 Def / 252 SpA
-Quiet Nature
-IVs: 0 Atk / 0 Spe
-- Diamond Storm
-- Moonblast
-- Stealth Rock
-- Trick Room
-
-Stakataka @ Weakness Policy
-Ability: Beast Boost
-Tera Type: Water
-EVs: 252 HP / 252 Atk / 4 SpD
-Brave Nature
-IVs: 0 Spe
-- Gyro Ball
-- Rock Slide
-- Earthquake
-- Trick Room
-
-Porygon2 @ Eviolite
-Ability: Download
+Blissey @ Heavy-Duty Boots
+Ability: Natural Cure
 Tera Type: Ghost
-EVs: 252 HP / 252 SpA / 4 SpD
-Quiet Nature
-IVs: 0 Atk / 0 Spe
-- Trick Room
-- Thunderbolt
-- Ice Beam
+EVs: 252 HP / 252 Def / 4 SpD
+Bold Nature
+IVs: 0 Atk
+- Seismic Toss
+- Soft-Boiled
+- Stealth Rock
+- Thunder Wave
+
+Toxapex @ Black Sludge
+Ability: Regenerator
+Tera Type: Water
+EVs: 252 HP / 252 Def / 4 SpD
+Bold Nature
+IVs: 0 Atk
+- Chilling Water
 - Recover
+- Haze
+- Toxic Spikes
+
+Clefable @ Leftovers
+Ability: Magic Guard
+Tera Type: Steel
+EVs: 252 HP / 252 Def / 4 SpD
+Bold Nature
+IVs: 0 Atk
+- Moonblast
+- Wish
+- Protect
+- Thunder Wave
+
+Clodsire @ Leftovers
+Ability: Water Absorb
+Tera Type: Steel
+EVs: 252 HP / 4 Def / 252 SpD
+Careful Nature
+- Earthquake
+- Recover
+- Toxic
+- Stealth Rock
+
+Alomomola @ Heavy-Duty Boots
+Ability: Regenerator
+Tera Type: Grass
+EVs: 252 HP / 252 Def / 4 SpD
+Bold Nature
+IVs: 0 Atk
+- Scald
+- Wish
+- Protect
+- Flip Turn
+
+Dondozo @ Leftovers
+Ability: Unaware
+Tera Type: Dragon
+EVs: 252 HP / 252 Def / 4 SpD
+Impish Nature
+- Wave Crash
+- Earthquake
+- Rest
+- Sleep Talk

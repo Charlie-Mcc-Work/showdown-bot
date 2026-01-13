@@ -15,6 +15,7 @@ BASE_PORT=8000
 TIMESTEPS=5000000
 MODE="joint"           # joint, player, or teambuilder
 CURRICULUM="adaptive"  # adaptive, progressive, matchup, complexity, none
+DEVICE="cuda"          # GPU works for multi-worker now that orphan cleanup is fixed
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
             CURRICULUM="$2"
             shift 2
             ;;
+        --device)
+            DEVICE="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage: $0 [options]"
             echo ""
@@ -56,6 +61,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --timesteps N         Steps per run per worker (default: 5000000)"
             echo "  --mode MODE           Training mode: joint, player (default: joint)"
             echo "  --curriculum STR      Curriculum strategy (default: adaptive)"
+            echo "  --device DEVICE       Device: cuda, cpu (default: cuda)"
             echo "  -h, --help            Show this help"
             echo ""
             echo "Example:"
@@ -130,9 +136,14 @@ cleanup() {
     # Force kill any remaining workers
     for pid in "${WORKER_PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
+            echo -e "${YELLOW}Force killing worker (PID: $pid)${NC}"
             kill -9 "$pid" 2>/dev/null || true
         fi
     done
+
+    # Kill ALL train_ou.py processes (catch any orphans)
+    echo -e "${BLUE}Killing any remaining train_ou.py processes...${NC}"
+    pkill -9 -f "train_ou.py" 2>/dev/null || true
 
     # Kill servers
     for pid in "${SERVER_PIDS[@]}"; do
@@ -147,9 +158,12 @@ cleanup() {
         port=$((BASE_PORT + i))
         pid=$(lsof -ti:$port 2>/dev/null || true)
         if [ -n "$pid" ]; then
-            kill "$pid" 2>/dev/null || true
+            kill -9 "$pid" 2>/dev/null || true
         fi
     done
+
+    # Kill any remaining pokemon-showdown processes
+    pkill -9 -f "pokemon-showdown" 2>/dev/null || true
 
     # Merge best checkpoint from workers
     merge_checkpoints
@@ -192,9 +206,26 @@ start_servers() {
         sleep 0.3
     done
 
+    # Wait for all servers to be ready
     echo -e "${BLUE}Waiting for servers to initialize...${NC}"
-    sleep 3
-    echo -e "${GREEN}All servers started${NC}"
+    for attempt in $(seq 1 30); do
+        ready=0
+        for i in $(seq 0 $((TOTAL_SERVERS - 1))); do
+            port=$((BASE_PORT + i))
+            if lsof -ti:$port >/dev/null 2>&1; then
+                ready=$((ready + 1))
+            fi
+        done
+        if [ "$ready" -eq "$TOTAL_SERVERS" ]; then
+            echo -e "${GREEN}All $TOTAL_SERVERS servers ready${NC}"
+            break
+        fi
+        if [ "$attempt" -eq 30 ]; then
+            echo -e "${RED}Error: Only $ready/$TOTAL_SERVERS servers started${NC}"
+            exit 1
+        fi
+        sleep 1
+    done
 }
 
 start_workers() {
@@ -232,7 +263,7 @@ print(f'Steps: {steps:,}')
 
     echo ""
     echo -e "${BLUE}Starting $NUM_WORKERS parallel OU training workers...${NC}"
-    echo -e "${CYAN}Mode: $MODE | Curriculum: $CURRICULUM${NC}"
+    echo -e "${CYAN}Mode: $MODE | Curriculum: $CURRICULUM | Device: $DEVICE${NC}"
     echo ""
 
     for worker in $(seq 0 $((NUM_WORKERS - 1))); do
@@ -257,7 +288,8 @@ print(f'Steps: {steps:,}')
             --server-ports $ports \
             --timesteps $TIMESTEPS \
             --checkpoint-dir $save_dir \
-            --log-dir $log_dir"
+            --log-dir $log_dir \
+            --device $DEVICE"
 
         # Add curriculum for joint mode
         if [ "$MODE" = "joint" ]; then
@@ -357,6 +389,26 @@ print(skill)
     fi
 }
 
+pre_cleanup() {
+    # Kill any existing train_ou.py processes from previous runs
+    existing=$(pgrep -f "train_ou.py" 2>/dev/null | wc -l)
+    if [ "$existing" -gt 0 ]; then
+        echo -e "${YELLOW}Found $existing existing train_ou.py processes, killing them...${NC}"
+        pkill -9 -f "train_ou.py" 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Kill any pokemon-showdown on our ports
+    for i in $(seq 0 $((TOTAL_SERVERS - 1))); do
+        port=$((BASE_PORT + i))
+        pid=$(lsof -ti:$port 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            echo -e "${YELLOW}Killing process on port $port${NC}"
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
 main() {
     echo -e "${GREEN}========================================${NC}"
     echo -e "${GREEN}  Parallel OU Self-Play Training${NC}"
@@ -368,10 +420,14 @@ main() {
     echo -e "Total environments: ${BLUE}$TOTAL_ENVS${NC}"
     echo -e "Servers per worker: ${BLUE}$SERVERS_PER_WORKER${NC}"
     echo -e "Total servers: ${BLUE}$TOTAL_SERVERS${NC} (ports $BASE_PORT-$((BASE_PORT + TOTAL_SERVERS - 1)))"
+    echo -e "Device: ${BLUE}$DEVICE${NC}"
     if [ "$MODE" = "joint" ]; then
         echo -e "Curriculum: ${BLUE}$CURRICULUM${NC}"
     fi
     echo ""
+
+    # Clean up any leftover processes from previous runs
+    pre_cleanup
 
     start_servers
 

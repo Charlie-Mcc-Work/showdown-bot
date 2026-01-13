@@ -16,6 +16,8 @@ from poke_env.player import Player
 from poke_env.player.battle_order import BattleOrder
 from poke_env.battle import AbstractBattle
 from poke_env.teambuilder import Teambuilder
+from poke_env.teambuilder.teambuilder_pokemon import TeambuilderPokemon
+from poke_env.data import to_id_str
 
 from showdown_bot.ou.player.state_encoder import OUStateEncoder, OUEncodedState
 from showdown_bot.ou.player.network import OUPlayerNetwork
@@ -258,7 +260,10 @@ class OUTrainablePlayer(Player):
 
 
 class OUTeambuilder(Teambuilder):
-    """Teambuilder that uses pre-loaded teams."""
+    """Teambuilder that uses pre-loaded teams.
+
+    Returns teams in packed format as required by poke-env.
+    """
 
     def __init__(self, teams: list[Team]):
         """Initialize with a list of teams.
@@ -270,70 +275,46 @@ class OUTeambuilder(Teambuilder):
         self._team_idx = 0
 
     def yield_team(self) -> str:
-        """Yield the next team in Showdown format."""
+        """Yield the next team in packed format (required by poke-env)."""
         if not self.teams:
             return ""
 
         team = self.teams[self._team_idx % len(self.teams)]
         self._team_idx += 1
-        return self._team_to_showdown(team)
+        return self._team_to_packed(team)
 
-    def _team_to_showdown(self, team: Team) -> str:
-        """Convert a Team to Showdown paste format."""
-        lines = []
+    def _team_to_packed(self, team: Team) -> str:
+        """Convert a Team to poke-env packed format.
+
+        Packed format: nickname|species|item|ability|moves|nature|evs|gender|ivs|shiny|level|happiness,hp,,,tera
+        Pokemon separated by ]
+        """
+        pokemon_packed = []
 
         for pokemon in team.pokemon:
-            # Species @ Item
-            if pokemon.nickname:
-                line = f"{pokemon.nickname} ({pokemon.species})"
-            else:
-                line = pokemon.species
+            # Convert EVs dict to list [hp, atk, def, spa, spd, spe]
+            ev_order = ["hp", "atk", "def", "spa", "spd", "spe"]
+            evs = [pokemon.evs.get(stat, 0) for stat in ev_order] if pokemon.evs else [0] * 6
 
-            if pokemon.item:
-                line += f" @ {pokemon.item}"
-            lines.append(line)
+            # Convert IVs dict to list
+            ivs = [pokemon.ivs.get(stat, 31) for stat in ev_order] if pokemon.ivs else [31] * 6
 
-            # Ability
-            if pokemon.ability:
-                lines.append(f"Ability: {pokemon.ability}")
+            # Create TeambuilderPokemon
+            tb_pokemon = TeambuilderPokemon(
+                nickname=pokemon.nickname,
+                species=pokemon.species,
+                item=pokemon.item,
+                ability=pokemon.ability,
+                moves=pokemon.moves,
+                nature=pokemon.nature,
+                evs=evs,
+                ivs=ivs,
+                tera_type=pokemon.tera_type,
+            )
 
-            # Tera Type
-            if pokemon.tera_type:
-                lines.append(f"Tera Type: {pokemon.tera_type}")
+            pokemon_packed.append(tb_pokemon.packed)
 
-            # EVs
-            if pokemon.evs:
-                ev_parts = []
-                stat_names = {"hp": "HP", "atk": "Atk", "def": "Def",
-                            "spa": "SpA", "spd": "SpD", "spe": "Spe"}
-                for stat, value in pokemon.evs.items():
-                    if value > 0:
-                        ev_parts.append(f"{value} {stat_names.get(stat, stat)}")
-                if ev_parts:
-                    lines.append(f"EVs: {' / '.join(ev_parts)}")
-
-            # IVs (only if not all 31)
-            if pokemon.ivs:
-                iv_parts = []
-                stat_names = {"hp": "HP", "atk": "Atk", "def": "Def",
-                            "spa": "SpA", "spd": "SpD", "spe": "Spe"}
-                for stat, value in pokemon.ivs.items():
-                    if value < 31:
-                        iv_parts.append(f"{value} {stat_names.get(stat, stat)}")
-                if iv_parts:
-                    lines.append(f"IVs: {' / '.join(iv_parts)}")
-
-            # Nature
-            if pokemon.nature:
-                lines.append(f"{pokemon.nature} Nature")
-
-            # Moves
-            for move in pokemon.moves:
-                lines.append(f"- {move}")
-
-            lines.append("")  # Blank line between Pokemon
-
-        return "\n".join(lines)
+        return "]".join(pokemon_packed)
 
 
 class OURLPlayer(Player):

@@ -32,6 +32,23 @@ from showdown_bot.ou.teambuilder.team_repr import PartialTeam, PokemonSlot
 
 logger = logging.getLogger(__name__)
 
+# Pokemon with locked Tera types (must use specific type)
+LOCKED_TERA_TYPES = {
+    "Ogerpon": "Grass",
+    "Ogerpon-Teal-Mask": "Grass",
+    "Ogerpon-Wellspring": "Water",
+    "Ogerpon-Hearthflame": "Fire",
+    "Ogerpon-Cornerstone": "Rock",
+    "Terapagos": "Stellar",
+    "Terapagos-Terastal": "Stellar",
+    "Terapagos-Stellar": "Stellar",
+}
+
+
+def _get_locked_tera_type(species: str) -> str | None:
+    """Return locked Tera type for Pokemon that require it, or None."""
+    return LOCKED_TERA_TYPES.get(species)
+
 
 class TeamGenerator(nn.Module):
     """Autoregressive team generator.
@@ -257,7 +274,18 @@ class TeamGenerator(nn.Module):
         if species_idx < len(self.viable_pokemon_names):
             species_name = self.viable_pokemon_names[species_idx]
         else:
-            species_name = "Pikachu"  # Fallback
+            # Fallback to a common OU Pokemon not already on the team
+            fallback_pokemon = [
+                "Great Tusk", "Gholdengo", "Kingambit", "Dragapult", "Heatran",
+                "Landorus-Therian", "Gliscor", "Iron Valiant", "Dragonite", "Kyurem"
+            ]
+            selected = partial_team.get_species_list()
+            for fallback in fallback_pokemon:
+                if fallback not in selected:
+                    species_name = fallback
+                    break
+            else:
+                species_name = "Corviknight"  # Last resort
 
         # Get usage data for this species for moves/item/ability
         if self._usage_generator is not None:
@@ -268,13 +296,14 @@ class TeamGenerator(nn.Module):
             nature, evs = self._usage_generator._sample_spread(species_name, stats, temperature)
             tera_type = self._usage_generator._sample_tera_type(species_name, stats, moves)
         else:
-            # No usage data, use placeholders
-            moves = ["Tackle", "Protect", "Rest", "Sleep Talk"]
+            # No usage data, use generic viable defaults
+            moves = ["Protect", "Substitute", "Rest", "Sleep Talk"]
             item = "Leftovers"
-            ability = "Ability"
+            ability = "Pressure"
             nature = "Serious"
-            evs = {"hp": 85, "atk": 85, "def": 85, "spa": 85, "spd": 85, "spe": 85}
-            tera_type = "Normal"
+            evs = {"hp": 252, "atk": 0, "def": 128, "spa": 0, "spd": 128, "spe": 0}
+            # Some Pokemon have locked Tera types
+            tera_type = _get_locked_tera_type(species_name) or "Normal"
 
         return PokemonSlot(
             species=species_name,
@@ -1022,11 +1051,12 @@ class UsageBasedGenerator:
     ) -> str:
         """Sample an ability for a Pokemon."""
         if not stats or not stats.common_abilities:
-            return "Ability"  # Placeholder
+            # Return a common generic ability instead of placeholder
+            return "Pressure"
 
         ability_items = [(k, v) for k, v in stats.common_abilities.items() if v > 0]
         if not ability_items:
-            return format_name(list(stats.common_abilities.keys())[0]) if stats.common_abilities else "Ability"
+            return format_name(list(stats.common_abilities.keys())[0]) if stats.common_abilities else "Pressure"
 
         ability = sample_weighted(ability_items, temperature)
         return format_name(ability)
@@ -1058,7 +1088,13 @@ class UsageBasedGenerator:
         """Select a tera type for a Pokemon.
 
         Strategy: Often match primary STAB or coverage type.
+        Some Pokemon have locked Tera types that must be used.
         """
+        # Check for locked Tera types (Ogerpon forms, etc.)
+        locked = _get_locked_tera_type(species)
+        if locked:
+            return locked
+
         # For now, pick a random type with bias toward common choices
         common_tera = ["Steel", "Fairy", "Water", "Ground", "Ghost", "Flying"]
 

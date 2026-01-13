@@ -138,6 +138,12 @@ class TrainingDisplay:
         # Track if we're in the middle of an in-place update
         self._in_place_active = False
 
+        # Check if stdout is a TTY (terminal) vs pipe/file
+        # If piped, use newlines instead of carriage returns for logging
+        self._is_tty = sys.stdout.isatty()
+        self._last_log_time = 0.0
+        self._log_interval = 5.0  # Log every 5 seconds when piped
+
     def _format_number(self, n: int) -> str:
         """Format large numbers with K/M suffix."""
         if n >= 1_000_000:
@@ -224,18 +230,22 @@ class TrainingDisplay:
         filled = int(bar_width * progress)
         bar = "=" * filled + "-" * (bar_width - filled)
 
-        status = (
-            f"\r[{bar}] {self._format_number(timesteps)}/{self._format_number(self.total_timesteps)} "
+        status_content = (
+            f"[{bar}] {self._format_number(timesteps)}/{self._format_number(self.total_timesteps)} "
             f"({progress:>5.1%}) | {speed:>5.0f}/s | Win:{win_rate:>3.0%} | "
             f"Skill:{skill_val:>5.0f} | Best:{best_skill:>5.0f} | ETA:{eta_str}"
         )
 
-        # Pad to overwrite any previous longer line
-        status = status.ljust(120)
-
-        # Print in place (no newline)
-        print(status, end="", flush=True)
-        self._in_place_active = True
+        if self._is_tty:
+            # Terminal: use carriage return for in-place updates
+            status = f"\r{status_content}".ljust(120)
+            print(status, end="", flush=True)
+            self._in_place_active = True
+        else:
+            # Piped/logged: use newlines at intervals to avoid flooding
+            if now - self._last_log_time >= self._log_interval:
+                print(status_content, flush=True)
+                self._last_log_time = now
 
     def message(self, msg: str):
         """Print an important message on a new line."""

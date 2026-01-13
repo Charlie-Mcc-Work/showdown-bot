@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from poke_env.player import Player, RandomPlayer
+from poke_env.player import Player
 from poke_env.player.battle_order import BattleOrder
 from poke_env.battle import AbstractBattle
 
@@ -299,12 +299,14 @@ class OUOpponentPool:
         self,
         opponent_info: OUOpponentInfo,
         battle_format: str = "gen9ou",
+        server_configuration=None,
     ) -> OUHistoricalPlayer:
         """Create a player from an opponent info.
 
         Args:
             opponent_info: The opponent to create a player for
             battle_format: Pokemon Showdown battle format
+            server_configuration: Optional server configuration
 
         Returns:
             An OUHistoricalPlayer instance
@@ -316,6 +318,7 @@ class OUOpponentPool:
             teams=self.teams,
             battle_format=battle_format,
             max_concurrent_battles=1,
+            server_configuration=server_configuration,
         )
 
     def update_stats(
@@ -472,11 +475,13 @@ class OUSelfPlayManager:
     def get_opponent(
         self,
         battle_format: str = "gen9ou",
+        server_configuration=None,
     ) -> tuple[Player, OUOpponentInfo | None, str]:
         """Get an opponent to play against.
 
         Args:
             battle_format: Pokemon Showdown battle format
+            server_configuration: Optional server configuration
 
         Returns:
             Tuple of (opponent_player, opponent_info or None, opponent_type)
@@ -487,24 +492,20 @@ class OUSelfPlayManager:
                 current_skill=self.agent_skill,
             )
             if opponent_info:
-                player = self.opponent_pool.create_player(opponent_info, battle_format)
+                player = self.opponent_pool.create_player(
+                    opponent_info, battle_format, server_configuration
+                )
                 self.games_vs_self_play += 1
                 return player, opponent_info, "self_play"
 
-        # Use baseline opponents (mix of random and max damage)
-        if random.random() < 0.5:
-            self.games_vs_random += 1
-            return RandomPlayer(
-                battle_format=battle_format,
-                max_concurrent_battles=1,
-            ), None, "random"
-        else:
-            self.games_vs_maxdamage += 1
-            return OUMaxDamagePlayer(
-                teams=self.teams,
-                battle_format=battle_format,
-                max_concurrent_battles=1,
-            ), None, "maxdamage"
+        # Use baseline opponent (gen9ou requires teams, so we use OUMaxDamagePlayer)
+        self.games_vs_maxdamage += 1
+        return OUMaxDamagePlayer(
+            teams=self.teams,
+            battle_format=battle_format,
+            max_concurrent_battles=1,
+            server_configuration=server_configuration,
+        ), None, "maxdamage"
 
     def update_after_game(
         self,
@@ -524,8 +525,8 @@ class OUSelfPlayManager:
                 opponent_info, won, self.agent_skill
             )
         else:
-            # Update skill rating against assumed baseline rating
-            baseline_skill = 800.0 if opponent_type == "random" else 900.0
+            # Update skill rating against assumed baseline rating (maxdamage)
+            baseline_skill = 900.0
             expected = 1.0 / (1.0 + 10 ** ((baseline_skill - self.agent_skill) / 400.0))
             actual = 1.0 if won else 0.0
             self.agent_skill += 16.0 * (actual - expected)  # Lower K-factor for baselines

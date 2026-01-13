@@ -36,7 +36,8 @@ while true; do
 
     for log in logs/worker_*.log; do
         # Get the last line (progress update)
-        line=$(tail -1 "$log" 2>/dev/null)
+        # Use tr to handle carriage returns - get last segment after any \r
+        line=$(tail -1 "$log" 2>/dev/null | tr '\r' '\n' | tail -1)
 
         # Check if it's a progress line (contains M/ pattern)
         if echo "$line" | grep -q "M/.*M"; then
@@ -55,8 +56,8 @@ while true; do
                 total_speed=$((total_speed + speed))
             fi
 
-            # Extract win rate (e.g., "Win:74%")
-            win=$(echo "$line" | grep -oP 'Win:\d+' | head -1 | grep -oP '\d+')
+            # Extract win rate (e.g., "Win:74%" or "Win: 9%" with space padding)
+            win=$(echo "$line" | grep -oP 'Win:\s*\d+' | head -1 | grep -oP '\d+')
             if [ -n "$win" ]; then
                 total_wins=$((total_wins + win))
                 total_games=$((total_games + 1))

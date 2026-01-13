@@ -45,7 +45,7 @@ warnings.filterwarnings("ignore", message=".*Memory Efficient attention.*experim
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import torch
-from poke_env.player import RandomPlayer
+# Note: RandomPlayer not used because gen9ou requires teams
 from poke_env.ps_client import ServerConfiguration
 from torch.utils.tensorboard import SummaryWriter
 
@@ -68,16 +68,137 @@ from showdown_bot.ou.training.curriculum import (
 )
 from showdown_bot.ou.teambuilder.generator import TeamGenerator
 from showdown_bot.ou.teambuilder.evaluator import TeamEvaluator
-from showdown_bot.ou.shared.data_loader import TeamLoader
+from showdown_bot.ou.shared.data_loader import TeamLoader, UsageStatsLoader
 from showdown_bot.ou.shared.embeddings import SharedEmbeddings, EmbeddingConfig
 
-# Set up logging
+# Set up logging - suppress verbose poke-env logs
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # Only show warnings and errors by default
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)  # Keep our own logs at INFO
+
+# Suppress poke-env player logs (very verbose)
+logging.getLogger("poke_env").setLevel(logging.WARNING)
+logging.getLogger("websockets").setLevel(logging.WARNING)
+
+
+class TrainingDisplay:
+    """Training display that updates in place using ANSI escape codes."""
+
+    def __init__(self, total_timesteps: int, start_timesteps: int = 0):
+        self.total_timesteps = total_timesteps
+        self.start_timesteps = start_timesteps
+        self.current_timesteps = start_timesteps
+        self.start_time = datetime.now()
+        self.last_update_time = self.start_time
+        self.last_timesteps = start_timesteps
+        self.iteration = 0
+
+        # Smoothed speed calculation
+        self._speed_history: list[float] = []
+        self._speed_window = 10
+
+        # Track if we're in the middle of an in-place update
+        self._in_place_active = False
+
+    def _format_number(self, n: int) -> str:
+        """Format large numbers with K/M suffix."""
+        if n >= 1_000_000:
+            return f"{n / 1_000_000:.2f}M"
+        elif n >= 1_000:
+            return f"{n / 1_000:.1f}K"
+        return str(n)
+
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as human-readable time."""
+        if seconds < 60:
+            return f"{seconds:.0f}s"
+        elif seconds < 3600:
+            return f"{seconds / 60:.0f}m"
+        else:
+            hours = int(seconds // 3600)
+            mins = int((seconds % 3600) // 60)
+            return f"{hours}h{mins}m"
+
+    def _get_speed(self) -> float:
+        """Get smoothed iterations per second."""
+        if not self._speed_history:
+            return 0.0
+        return sum(self._speed_history) / len(self._speed_history)
+
+    def close(self):
+        """Move to new line after in-place updates."""
+        if self._in_place_active:
+            print()  # Move past the in-place line
+            self._in_place_active = False
+
+    def update(
+        self,
+        timesteps: int,
+        win_rate: float = 0.0,
+        skill: float = 1000.0,
+        best_skill: float = 1000.0,
+        pool_size: int = 0,
+    ):
+        """Update the display in place."""
+        now = datetime.now()
+        self.current_timesteps = timesteps
+        self.iteration += 1
+
+        # Calculate speed
+        time_delta = (now - self.last_update_time).total_seconds()
+        if time_delta > 0:
+            step_delta = timesteps - self.last_timesteps
+            instant_speed = step_delta / time_delta
+            self._speed_history.append(instant_speed)
+            if len(self._speed_history) > self._speed_window:
+                self._speed_history.pop(0)
+
+        self.last_update_time = now
+        self.last_timesteps = timesteps
+
+        # Calculate progress and ETA
+        speed = self._get_speed()
+        steps_done = timesteps - self.start_timesteps
+        steps_total = self.total_timesteps - self.start_timesteps
+        progress = steps_done / steps_total if steps_total > 0 else 0.0
+
+        # ETA calculation
+        if speed > 0 and progress < 1.0:
+            remaining_steps = steps_total - steps_done
+            eta_seconds = remaining_steps / speed
+            eta_str = self._format_time(eta_seconds)
+        else:
+            eta_str = "--"
+
+        # Build the status line
+        # Format: [progress bar] 7.5M/12M (62%) | 1234/s | Win:85% | Skill:30066 | ETA:2h15m
+        bar_width = 20
+        filled = int(bar_width * progress)
+        bar = "=" * filled + "-" * (bar_width - filled)
+
+        status = (
+            f"\r[{bar}] {self._format_number(timesteps)}/{self._format_number(self.total_timesteps)} "
+            f"({progress:>5.1%}) | {speed:>5.0f}/s | Win:{win_rate:>3.0%} | "
+            f"Skill:{skill:>5.0f} | Best:{best_skill:>5.0f} | ETA:{eta_str}"
+        )
+
+        # Pad to overwrite any previous longer line
+        status = status.ljust(120)
+
+        # Print in place (no newline)
+        print(status, end="", flush=True)
+        self._in_place_active = True
+
+    def message(self, msg: str):
+        """Print an important message on a new line."""
+        if self._in_place_active:
+            print()  # Move to new line first
+            self._in_place_active = False
+        print(f">> {msg}")
 
 
 class OUTrainingManager:
@@ -188,81 +309,119 @@ class OUTrainingManager:
             eval_interval: Steps between evaluations
             save_interval: Steps between checkpoint saves
         """
-        logger.info(f"Starting OU training for {total_timesteps:,} timesteps")
-        logger.info(f"Using {self.num_envs} parallel environment(s)")
+        # Print header
+        print("\n" + "=" * 60)
+        print("Pokemon Showdown OU RL Bot - Training")
+        print("=" * 60)
+        print(f"Device: {self.device}")
+        print(f"Training for: {total_timesteps:,} steps")
+        print(f"Starting from: {self.total_timesteps:,}")
+        print(f"Target: {self.total_timesteps + total_timesteps:,}")
+        print(f"Parallel environments: {self.num_envs}")
         if self.self_play_manager:
-            logger.info(f"Self-play ratio: {self.self_play_manager.self_play_ratio:.0%}")
+            print(f"Self-play: Enabled (ratio: {self.self_play_manager.self_play_ratio:.0%})")
+        else:
+            print("Self-play: Disabled")
+        print("=" * 60 + "\n")
 
-        start_time = datetime.now()
+        # Create display
+        target_timesteps = self.total_timesteps + total_timesteps
+        display = TrainingDisplay(
+            total_timesteps=target_timesteps,
+            start_timesteps=self.total_timesteps,
+        )
+
+        # Track best skill for display
+        best_skill = self.trainer.skill_rating
+        if self.self_play_manager:
+            best_skill = self.self_play_manager.agent_skill
+
         last_eval = self.total_timesteps
         last_save = self.total_timesteps
 
-        while self.total_timesteps < total_timesteps and not self.should_stop:
-            # Add checkpoint to opponent pool if needed
-            if self.self_play_manager and self.self_play_manager.should_add_checkpoint(self.total_timesteps):
-                self.self_play_manager.add_checkpoint(self.network, self.total_timesteps)
+        try:
+            while self.total_timesteps < target_timesteps and not self.should_stop:
+                # Add checkpoint to opponent pool if needed
+                if self.self_play_manager and self.self_play_manager.should_add_checkpoint(self.total_timesteps):
+                    self.self_play_manager.add_checkpoint(self.network, self.total_timesteps)
+                    display.message(f"Added checkpoint to opponent pool (size: {self.self_play_manager.opponent_pool.size})")
 
-            # Collect experience from battles
-            steps, episodes = await self._collect_rollout()
-            self.total_timesteps += steps
-            self.total_episodes += episodes
+                # Collect experience from battles
+                steps, episodes = await self._collect_rollout()
+                self.total_timesteps += steps
+                self.total_episodes += episodes
 
-            # PPO update
-            if len(self.trainer.buffer) >= self.config.player_batch_size:
-                metrics = self.trainer.update()
+                # PPO update
+                if len(self.trainer.buffer) >= self.config.player_batch_size:
+                    metrics = self.trainer.update()
 
-                # Log progress
-                elapsed = (datetime.now() - start_time).total_seconds()
-                steps_per_sec = self.total_timesteps / max(elapsed, 1)
+                    # Get current skill
+                    if self.self_play_manager:
+                        stats = self.self_play_manager.get_stats()
+                        current_skill = stats["agent_skill"]
+                        pool_size = stats["pool_size"]
+                    else:
+                        current_skill = self.trainer.skill_rating
+                        pool_size = 0
 
-                # Build log message
-                log_parts = [
-                    f"Step {self.total_timesteps:,}",
-                    f"Episodes: {self.total_episodes:,}",
-                    f"Win rate: {self.trainer.win_rate:.1%}",
-                ]
+                    # Track best skill
+                    if current_skill > best_skill:
+                        old_best = best_skill
+                        best_skill = current_skill
+                        self._save_checkpoint(best=True)
+                        display.message(f"NEW BEST MODEL! Skill: {old_best:.0f} -> {current_skill:.0f}")
 
-                if self.self_play_manager:
-                    stats = self.self_play_manager.get_stats()
-                    log_parts.append(f"Skill: {stats['agent_skill']:.0f}")
-                    log_parts.append(f"Pool: {stats['pool_size']}")
-                else:
-                    log_parts.append(f"Skill: {self.trainer.skill_rating:.0f}")
-
-                log_parts.append(f"Speed: {steps_per_sec:.1f} steps/s")
-                logger.info(" | ".join(log_parts))
-
-                # Log self-play stats to TensorBoard
-                if self.self_play_manager and self.trainer.writer:
-                    stats = self.self_play_manager.get_stats()
-                    self.trainer.writer.add_scalar(
-                        "self_play/agent_skill", stats["agent_skill"], self.total_timesteps
-                    )
-                    self.trainer.writer.add_scalar(
-                        "self_play/pool_size", stats["pool_size"], self.total_timesteps
-                    )
-                    self.trainer.writer.add_scalar(
-                        "self_play/ratio_actual", stats["self_play_ratio_actual"], self.total_timesteps
+                    # Update display
+                    display.update(
+                        timesteps=self.total_timesteps,
+                        win_rate=self.trainer.win_rate,
+                        skill=current_skill,
+                        best_skill=best_skill,
+                        pool_size=pool_size,
                     )
 
-            # Periodic evaluation
-            if self.total_timesteps - last_eval >= eval_interval:
-                await self._evaluate()
-                last_eval = self.total_timesteps
+                    # Log to TensorBoard
+                    if self.self_play_manager and self.trainer.writer:
+                        self.trainer.writer.add_scalar(
+                            "self_play/agent_skill", stats["agent_skill"], self.total_timesteps
+                        )
+                        self.trainer.writer.add_scalar(
+                            "self_play/pool_size", stats["pool_size"], self.total_timesteps
+                        )
+                        self.trainer.writer.add_scalar(
+                            "self_play/ratio_actual", stats["self_play_ratio_actual"], self.total_timesteps
+                        )
 
-            # Periodic checkpoint
-            if self.total_timesteps - last_save >= save_interval:
-                self._save_checkpoint()
-                last_save = self.total_timesteps
+                # Periodic evaluation
+                if self.total_timesteps - last_eval >= eval_interval:
+                    display.message("Running evaluation...")
+                    results = await self._evaluate()
+                    display.message(f"Eval vs MaxDamage: {results['vs_maxdamage']:.1%}")
+                    last_eval = self.total_timesteps
 
-            # Memory cleanup
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # Periodic checkpoint
+                if self.total_timesteps - last_save >= save_interval:
+                    self._save_checkpoint()
+                    display.message(f"Saved checkpoint at step {self.total_timesteps:,}")
+                    last_save = self.total_timesteps
 
-        # Final save
+                # Memory cleanup
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        finally:
+            display.close()
+
+        # Final save and summary
         self._save_checkpoint(final=True)
-        logger.info(f"Training complete! Total episodes: {self.total_episodes:,}")
+        print("\n" + "=" * 60)
+        print("Training Complete!")
+        print(f"Total timesteps: {self.total_timesteps:,}")
+        print(f"Total episodes: {self.total_episodes:,}")
+        print(f"Final win rate: {self.trainer.win_rate:.1%}")
+        print(f"Final skill: {best_skill:.0f}")
+        print("=" * 60)
 
     async def _collect_rollout(self) -> tuple[int, int]:
         """Collect experience from battles.
@@ -307,22 +466,15 @@ class OUTrainingManager:
                 opponents.append(opponent)
                 opponent_infos.append((opponent_info, opponent_type))
             else:
-                # Fallback: Random opponent selection (mix of strategies)
-                if random.random() < 0.5:
-                    opponent = RandomPlayer(
-                        battle_format="gen9ou",
-                        max_concurrent_battles=1,
-                        server_configuration=server_config,
-                    )
-                    opponent_infos.append((None, "random"))
-                else:
-                    opponent = OUMaxDamagePlayer(
-                        teams=self.teams,
-                        battle_format="gen9ou",
-                        max_concurrent_battles=1,
-                        server_configuration=server_config,
-                    )
-                    opponent_infos.append((None, "maxdamage"))
+                # Fallback: Use OUMaxDamagePlayer (gen9ou requires teams)
+                # RandomPlayer doesn't support teams, so we use maxdamage for both
+                opponent = OUMaxDamagePlayer(
+                    teams=self.teams,
+                    battle_format="gen9ou",
+                    max_concurrent_battles=1,
+                    server_configuration=server_config,
+                )
+                opponent_infos.append((None, "maxdamage"))
                 opponents.append(opponent)
 
         try:
@@ -452,9 +604,7 @@ class OUTrainingManager:
         Returns:
             Evaluation metrics
         """
-        logger.info("Running evaluation...")
-
-        results = {"vs_random": 0, "vs_maxdamage": 0}
+        results = {"vs_maxdamage": 0}
 
         # Create evaluation player
         eval_player = OUNeuralNetworkPlayer(
@@ -468,21 +618,7 @@ class OUTrainingManager:
         )
 
         try:
-            # vs Random
-            random_opponent = RandomPlayer(
-                battle_format="gen9ou",
-                max_concurrent_battles=1,
-            )
-            await eval_player.battle_against(random_opponent, n_battles=n_games)
-
-            wins = sum(1 for b in eval_player.battles.values() if b.won)
-            results["vs_random"] = wins / n_games
-            logger.info(f"  vs Random: {wins}/{n_games} ({results['vs_random']:.1%})")
-
-            # Clear battles for next evaluation
-            eval_player._battles = {}
-
-            # vs MaxDamage
+            # vs MaxDamage (gen9ou requires teams, RandomPlayer doesn't support them)
             maxdmg_opponent = OUMaxDamagePlayer(
                 teams=self.teams,
                 battle_format="gen9ou",
@@ -492,26 +628,20 @@ class OUTrainingManager:
 
             wins = sum(1 for b in eval_player.battles.values() if b.won)
             results["vs_maxdamage"] = wins / n_games
-            logger.info(f"  vs MaxDamage: {wins}/{n_games} ({results['vs_maxdamage']:.1%})")
 
         finally:
-            await self._cleanup_players([eval_player, random_opponent, maxdmg_opponent])
+            await self._cleanup_players([eval_player, maxdmg_opponent])
 
         # Log to TensorBoard
         if self.trainer.writer:
-            self.trainer.writer.add_scalar(
-                "eval/vs_random", results["vs_random"], self.total_timesteps
-            )
             self.trainer.writer.add_scalar(
                 "eval/vs_maxdamage", results["vs_maxdamage"], self.total_timesteps
             )
 
         return results
 
-    def _save_checkpoint(self, final: bool = False) -> None:
+    def _save_checkpoint(self, final: bool = False, best: bool = False) -> None:
         """Save a training checkpoint."""
-        checkpoint_path = self.checkpoint_dir / "latest.pt"
-
         checkpoint = {
             "model_state_dict": self.network.state_dict(),
             "optimizer_state_dict": self.trainer.optimizer.state_dict(),
@@ -523,20 +653,20 @@ class OUTrainingManager:
             "config": self.config.to_dict(),
         }
 
+        # Save best model
+        if best:
+            best_path = self.checkpoint_dir / "best_model.pt"
+            torch.save(checkpoint, best_path)
+            return
+
+        # Save latest checkpoint
+        checkpoint_path = self.checkpoint_dir / "latest.pt"
         torch.save(checkpoint, checkpoint_path)
-        logger.info(f"Saved checkpoint to {checkpoint_path}")
 
         # Also save periodic checkpoint
         if not final:
             periodic_path = self.checkpoint_dir / f"checkpoint_{self.total_timesteps}.pt"
             torch.save(checkpoint, periodic_path)
-
-        # Save best model based on win rate
-        if self.trainer.win_rate >= 0.5:
-            best_path = self.checkpoint_dir / "best_model.pt"
-            if not best_path.exists():
-                torch.save(checkpoint, best_path)
-                logger.info(f"Saved new best model with {self.trainer.win_rate:.1%} win rate")
 
     def load_checkpoint(self, path: str) -> None:
         """Load a training checkpoint."""
@@ -590,12 +720,19 @@ class TeambuilderTrainingManager:
         emb_config = EmbeddingConfig()
         self.embeddings = SharedEmbeddings(emb_config)
 
+        # Load usage stats for team generation
+        logger.info("Loading usage stats...")
+        usage_loader = UsageStatsLoader()
+        usage_loader.load(tier="gen9ou", rating=1695)
+
         # Create teambuilder components
         self.generator = TeamGenerator(
             shared_embeddings=self.embeddings,
             hidden_dim=512,
             num_heads=8,
             num_layers=4,
+            usage_loader=usage_loader,
+            tier="gen9ou",
         ).to(device)
 
         self.evaluator = TeamEvaluator(
@@ -770,8 +907,9 @@ class TeambuilderTrainingManager:
         )
 
         try:
-            # Play against random opponent
-            opponent = RandomPlayer(
+            # Play against maxdamage opponent (gen9ou requires teams)
+            opponent = OUMaxDamagePlayer(
+                teams=self.sample_teams,
                 battle_format="gen9ou",
                 max_concurrent_battles=1,
             )
@@ -873,6 +1011,11 @@ class JointTrainingManager:
         num_params = sum(p.numel() for p in self.network.parameters())
         logger.info(f"Player model parameters: {num_params:,}")
 
+        # Load usage stats for team generation
+        logger.info("Loading usage stats...")
+        usage_loader = UsageStatsLoader()
+        usage_loader.load(tier="gen9ou", rating=1695)
+
         # Create teambuilder components
         logger.info("Initializing teambuilder...")
         self.generator = TeamGenerator(
@@ -880,6 +1023,8 @@ class JointTrainingManager:
             hidden_dim=512,
             num_heads=8,
             num_layers=4,
+            usage_loader=usage_loader,
+            tier="gen9ou",
         ).to(device)
 
         self.evaluator = TeamEvaluator(
@@ -937,62 +1082,95 @@ class JointTrainingManager:
             eval_interval: Steps between evaluations
             save_interval: Steps between checkpoint saves
         """
-        logger.info(f"Starting joint training for {total_timesteps:,} timesteps")
-        logger.info(f"Using {self.num_envs} parallel environment(s)")
-        logger.info(f"Active team pool: {len(self.joint_trainer.active_teams)} teams")
+        # Print header
+        print("\n" + "=" * 60)
+        print("Pokemon Showdown OU RL Bot - Joint Training")
+        print("=" * 60)
+        print(f"Device: {self.device}")
+        print(f"Training for: {total_timesteps:,} steps")
+        print(f"Starting from: {self.total_timesteps:,}")
+        print(f"Target: {self.total_timesteps + total_timesteps:,}")
+        print(f"Parallel environments: {self.num_envs}")
+        print(f"Active team pool: {len(self.joint_trainer.active_teams)} teams")
+        print(f"Curriculum: {self.curriculum_strategy}")
+        print("=" * 60 + "\n")
 
-        start_time = datetime.now()
+        # Create display
+        target_timesteps = self.total_timesteps + total_timesteps
+        display = TrainingDisplay(
+            total_timesteps=target_timesteps,
+            start_timesteps=self.total_timesteps,
+        )
+
+        # Track best skill
+        best_skill = self.joint_trainer.player_trainer.skill_rating
+
         last_eval = self.total_timesteps
         last_save = self.total_timesteps
 
-        while self.total_timesteps < total_timesteps and not self.should_stop:
-            # Collect experience from battles
-            steps, episodes = await self._collect_rollout()
-            self.total_timesteps += steps
-            self.total_episodes += episodes
+        try:
+            while self.total_timesteps < target_timesteps and not self.should_stop:
+                # Collect experience from battles
+                steps, episodes = await self._collect_rollout()
+                self.total_timesteps += steps
+                self.total_episodes += episodes
 
-            # Joint training step (updates player and teambuilder)
-            buffer = self.joint_trainer.player_trainer.buffer
-            if len(buffer) >= self.config.player_batch_size:
-                metrics = self.joint_trainer.training_step()
+                # Joint training step (updates player and teambuilder)
+                buffer = self.joint_trainer.player_trainer.buffer
+                if len(buffer) >= self.config.player_batch_size:
+                    metrics = self.joint_trainer.training_step()
 
-                # Log progress
-                elapsed = (datetime.now() - start_time).total_seconds()
-                steps_per_sec = self.total_timesteps / max(elapsed, 1)
+                    # Get summary
+                    summary = self.joint_trainer.get_summary()
+                    current_skill = summary["player_skill_rating"]
 
-                summary = self.joint_trainer.get_summary()
-                logger.info(
-                    f"Step {self.total_timesteps:,} | "
-                    f"Episodes: {self.total_episodes:,} | "
-                    f"Win rate: {summary['player_win_rate']:.1%} | "
-                    f"Skill: {summary['player_skill_rating']:.0f} | "
-                    f"Best team: {summary['best_team_win_rate']:.1%} | "
-                    f"Teams: {summary['active_teams']} | "
-                    f"Speed: {steps_per_sec:.1f} steps/s"
-                )
+                    # Track best skill
+                    if current_skill > best_skill:
+                        old_best = best_skill
+                        best_skill = current_skill
+                        self._save_checkpoint(best=True)
+                        display.message(f"NEW BEST MODEL! Skill: {old_best:.0f} -> {current_skill:.0f}")
 
-            # Periodic evaluation
-            if self.total_timesteps - last_eval >= eval_interval:
-                await self._evaluate()
-                last_eval = self.total_timesteps
+                    # Update display
+                    display.update(
+                        timesteps=self.total_timesteps,
+                        win_rate=summary["player_win_rate"],
+                        skill=current_skill,
+                        best_skill=best_skill,
+                    )
 
-            # Periodic checkpoint
-            if self.total_timesteps - last_save >= save_interval:
-                self._save_checkpoint()
-                last_save = self.total_timesteps
+                # Periodic evaluation
+                if self.total_timesteps - last_eval >= eval_interval:
+                    display.message("Running evaluation...")
+                    results = await self._evaluate()
+                    display.message(f"Eval vs MaxDamage: {results['vs_maxdamage']:.1%}")
+                    last_eval = self.total_timesteps
 
-            # Memory cleanup
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                # Periodic checkpoint
+                if self.total_timesteps - last_save >= save_interval:
+                    self._save_checkpoint()
+                    display.message(f"Saved checkpoint at step {self.total_timesteps:,}")
+                    last_save = self.total_timesteps
 
-        # Final save
+                # Memory cleanup
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        finally:
+            display.close()
+
+        # Final save and summary
         self._save_checkpoint(final=True)
         summary = self.joint_trainer.get_summary()
-        logger.info(f"Joint training complete!")
-        logger.info(f"  Total episodes: {self.total_episodes:,}")
-        logger.info(f"  Final win rate: {summary['player_win_rate']:.1%}")
-        logger.info(f"  Teams generated: {summary['teams_generated']}")
+        print("\n" + "=" * 60)
+        print("Joint Training Complete!")
+        print(f"Total timesteps: {self.total_timesteps:,}")
+        print(f"Total episodes: {self.total_episodes:,}")
+        print(f"Final win rate: {summary['player_win_rate']:.1%}")
+        print(f"Final skill: {best_skill:.0f}")
+        print(f"Teams generated: {summary['teams_generated']}")
+        print("=" * 60)
 
     async def _collect_rollout(self) -> tuple[int, int]:
         """Collect experience from battles using teams from the joint trainer.
@@ -1041,13 +1219,9 @@ class JointTrainingManager:
             opponent_type = self.joint_trainer.get_opponent_type()
             opponent_types_used.append(opponent_type.value)
 
-            if opponent_type == OpponentType.RANDOM:
-                opponent = RandomPlayer(
-                    battle_format="gen9ou",
-                    max_concurrent_battles=1,
-                    server_configuration=server_config,
-                )
-            elif opponent_type == OpponentType.MAXDAMAGE:
+            # Note: gen9ou requires teams, so we use OUMaxDamagePlayer for all opponent types
+            # (RandomPlayer doesn't support teams)
+            if opponent_type == OpponentType.RANDOM or opponent_type == OpponentType.MAXDAMAGE:
                 opponent = OUMaxDamagePlayer(
                     teams=self.sample_teams,
                     battle_format="gen9ou",
@@ -1190,9 +1364,7 @@ class JointTrainingManager:
 
     async def _evaluate(self, n_games: int = 20) -> dict:
         """Evaluate current policy against baselines."""
-        logger.info("Running evaluation...")
-
-        results = {"vs_random": 0, "vs_maxdamage": 0}
+        results = {"vs_maxdamage": 0}
 
         # Use best performing team for evaluation
         best_teams = self.joint_trainer.teambuilder_trainer.outcome_buffer.get_best_teams(n=1)
@@ -1212,20 +1384,7 @@ class JointTrainingManager:
         )
 
         try:
-            # vs Random
-            random_opponent = RandomPlayer(
-                battle_format="gen9ou",
-                max_concurrent_battles=1,
-            )
-            await eval_player.battle_against(random_opponent, n_battles=n_games)
-
-            wins = sum(1 for b in eval_player.battles.values() if b.won)
-            results["vs_random"] = wins / n_games
-            logger.info(f"  vs Random: {wins}/{n_games} ({results['vs_random']:.1%})")
-
-            eval_player._battles = {}
-
-            # vs MaxDamage
+            # vs MaxDamage (gen9ou requires teams, RandomPlayer doesn't support them)
             maxdmg_opponent = OUMaxDamagePlayer(
                 teams=self.sample_teams,
                 battle_format="gen9ou",
@@ -1235,35 +1394,35 @@ class JointTrainingManager:
 
             wins = sum(1 for b in eval_player.battles.values() if b.won)
             results["vs_maxdamage"] = wins / n_games
-            logger.info(f"  vs MaxDamage: {wins}/{n_games} ({results['vs_maxdamage']:.1%})")
 
         finally:
-            await self._cleanup_players([eval_player, random_opponent, maxdmg_opponent])
+            await self._cleanup_players([eval_player, maxdmg_opponent])
 
         # Log to TensorBoard
         if self.joint_trainer.writer:
-            self.joint_trainer.writer.add_scalar(
-                "eval/vs_random", results["vs_random"], self.total_timesteps
-            )
             self.joint_trainer.writer.add_scalar(
                 "eval/vs_maxdamage", results["vs_maxdamage"], self.total_timesteps
             )
 
         return results
 
-    def _save_checkpoint(self, final: bool = False) -> None:
+    def _save_checkpoint(self, final: bool = False, best: bool = False) -> None:
         """Save joint training checkpoint."""
-        self.joint_trainer.save_checkpoint(self.checkpoint_dir)
-
-        # Also save just the player model for easier loading
+        # Save player model
         player_checkpoint = {
             "model_state_dict": self.network.state_dict(),
             "total_timesteps": self.total_timesteps,
             "total_episodes": self.total_episodes,
             "config": self.config.to_dict(),
         }
+
+        if best:
+            torch.save(player_checkpoint, self.checkpoint_dir / "best_model.pt")
+            return
+
+        # Save full joint checkpoint
+        self.joint_trainer.save_checkpoint(self.checkpoint_dir)
         torch.save(player_checkpoint, self.checkpoint_dir / "player_model.pt")
-        logger.info(f"Saved joint checkpoint to {self.checkpoint_dir}")
 
     def load_checkpoint(self, path: str) -> None:
         """Load a joint training checkpoint."""
@@ -1285,8 +1444,17 @@ class JointTrainingManager:
         logger.info(f"  Timesteps: {self.total_timesteps:,}")
 
 
-def get_device() -> torch.device:
-    """Get the best available device."""
+def get_device(device_str: str | None = None) -> torch.device:
+    """Get the device to use for training.
+
+    Args:
+        device_str: Explicit device string ("cuda", "cpu", "mps") or None for auto-detect
+    """
+    if device_str:
+        device = torch.device(device_str)
+        logger.info(f"Using device: {device}")
+        return device
+
     if torch.cuda.is_available():
         device = torch.device("cuda")
         logger.info(f"Using GPU: {torch.cuda.get_device_name()}")
@@ -1324,7 +1492,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> Path | None:
 
 async def main_async(args: argparse.Namespace) -> None:
     """Async main function."""
-    device = get_device()
+    device = get_device(args.device if args.device != "auto" else None)
     config = OUTrainingConfig()
 
     # Print server reminder
@@ -1558,6 +1726,15 @@ def main() -> None:
         choices=["adaptive", "progressive", "matchup", "complexity", "none"],
         default="adaptive",
         help="Curriculum learning strategy (joint mode). 'none' disables curriculum.",
+    )
+
+    # Device selection
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["cuda", "cpu", "mps", "auto"],
+        default="auto",
+        help="Device for training. Use 'cpu' for multi-worker to avoid GPU memory issues.",
     )
 
     args = parser.parse_args()

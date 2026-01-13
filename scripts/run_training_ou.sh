@@ -1,37 +1,43 @@
 #!/bin/bash
-# Automated OU training script with multi-server support
-# - Starts Pokemon Showdown servers automatically
-# - Resumes from checkpoint or best model
-# - Restarts on memory issues or run completion
-# - Ctrl+C gracefully exits everything
+# Simple OU training script - handles everything automatically
+#
+# Usage:
+#   ./scripts/run_training_ou.sh                    # 8 envs (optimal for single GPU)
+#   ./scripts/run_training_ou.sh --num-envs 6       # 6 envs (lighter memory usage)
+#   ./scripts/run_training_ou.sh --mode player      # Player-only training (faster)
 
 set -e
 
-# Configuration (defaults)
-NUM_SERVERS=3
+# Defaults
+NUM_WORKERS=1
+ENVS_PER_WORKER=8  # Sweet spot for single GPU - more envs adds overhead
+MODE="joint"
+CURRICULUM="adaptive"
+DEVICE="cuda"  # GPU works for multiple workers now that orphan cleanup is fixed
+TIMESTEPS=5000000
 BASE_PORT=8000
-NUM_ENVS=12  # Should be multiple of NUM_SERVERS for even distribution
-TIMESTEPS=5000000  # 5M steps per run
-MODE="joint"  # joint, player, or teambuilder
-CURRICULUM="adaptive"  # adaptive, progressive, matchup, complexity, none
 
-# Parse command line arguments
+# Parse args
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --num-envs)
-            NUM_ENVS="$2"
+        --workers|-w)
+            NUM_WORKERS="$2"
             shift 2
             ;;
-        --num-servers)
-            NUM_SERVERS="$2"
+        --num-envs|--envs|-e)
+            ENVS_PER_WORKER="$2"
             shift 2
             ;;
-        --timesteps)
-            TIMESTEPS="$2"
-            shift 2
-            ;;
-        --mode)
+        --mode|-m)
             MODE="$2"
+            shift 2
+            ;;
+        --device|-d)
+            DEVICE="$2"
+            shift 2
+            ;;
+        --timesteps|-t)
+            TIMESTEPS="$2"
             shift 2
             ;;
         --curriculum)
@@ -40,13 +46,18 @@ while [[ $# -gt 0 ]]; do
             ;;
         -h|--help)
             echo "Usage: $0 [options]"
+            echo ""
             echo "Options:"
-            echo "  --num-envs N      Number of parallel environments (default: 12)"
-            echo "  --num-servers N   Number of PS servers to start (default: 3)"
-            echo "  --timesteps N     Steps per training run (default: 5000000)"
-            echo "  --mode MODE       Training mode: joint, player, teambuilder (default: joint)"
-            echo "  --curriculum STR  Curriculum strategy: adaptive, progressive, matchup, complexity, none (default: adaptive)"
-            echo "  -h, --help        Show this help"
+            echo "  --num-envs, -e N   Number of parallel environments (default: 8)"
+            echo "  --mode, -m MODE    Training mode: joint, player (default: joint)"
+            echo "  --device, -d DEV   Device: cuda, cpu (default: cuda)"
+            echo "  --timesteps, -t N  Steps to train (default: 5000000)"
+            echo "  --curriculum STR   Curriculum: adaptive, progressive, none (default: adaptive)"
+            echo ""
+            echo "Examples:"
+            echo "  $0                      # 8 parallel battles on GPU (optimal)"
+            echo "  $0 --num-envs 6         # 6 parallel battles (lighter memory)"
+            echo "  $0 --mode player        # Faster player-only training"
             exit 0
             ;;
         *)
@@ -56,234 +67,326 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Auto device selection
+if [ "$DEVICE" = "auto" ]; then
+    DEVICE="cuda"
+fi
+
+# Calculate servers needed (1 per 3-4 envs, minimum 2 for good throughput)
+SERVERS_PER_WORKER=$(( (ENVS_PER_WORKER + 2) / 3 ))
+[ "$SERVERS_PER_WORKER" -lt 2 ] && SERVERS_PER_WORKER=2
+TOTAL_SERVERS=$((NUM_WORKERS * SERVERS_PER_WORKER))
+TOTAL_ENVS=$((NUM_WORKERS * ENVS_PER_WORKER))
+
 PS_DIR="$HOME/pokemon-showdown"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Colors for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+CYAN='\033[0;36m'
+NC='\033[0m'
 
-# Track server PIDs
+# Checkpoint paths based on mode
+# Note: For joint mode, train_ou.py appends /joint to checkpoint_dir internally
+# So we pass the base dir and let Python handle the mode-specific subdirectory
+if [ "$MODE" = "joint" ]; then
+    CHECKPOINT_DIR="data/checkpoints/ou"
+    CHECKPOINT_RESUME_DIR="data/checkpoints/ou/joint"  # Where Python actually saves
+    LOG_DIR="runs/ou/joint"
+else
+    CHECKPOINT_DIR="data/checkpoints/ou"
+    CHECKPOINT_RESUME_DIR="data/checkpoints/ou"
+    LOG_DIR="runs/ou"
+fi
+
 SERVER_PIDS=()
+WORKER_PIDS=()
 
-# Track if user requested exit
-USER_EXIT_REQUESTED=false
-
-# Cleanup function
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
 
-    # Kill all Pokemon Showdown servers we started
+    # Kill workers gracefully first
+    for pid in "${WORKER_PIDS[@]}"; do
+        kill -INT "$pid" 2>/dev/null || true
+    done
+    sleep 3
+
+    # Force kill any remaining train_ou processes
+    pkill -9 -f "train_ou.py" 2>/dev/null || true
+
+    # Kill servers
     for pid in "${SERVER_PIDS[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            echo -e "${BLUE}Stopping server (PID: $pid)${NC}"
-            kill "$pid" 2>/dev/null || true
-        fi
+        kill -9 "$pid" 2>/dev/null || true
     done
 
-    # Also kill any node processes on our ports (in case PIDs were lost)
-    for i in $(seq 0 $((NUM_SERVERS - 1))); do
-        port=$((BASE_PORT + i))
+    # Kill any pokemon-showdown on our ports
+    for port in $(seq $BASE_PORT $((BASE_PORT + TOTAL_SERVERS - 1))); do
         pid=$(lsof -ti:$port 2>/dev/null || true)
-        if [ -n "$pid" ]; then
-            echo -e "${BLUE}Killing process on port $port (PID: $pid)${NC}"
-            kill "$pid" 2>/dev/null || true
-        fi
+        [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null || true
     done
 
     echo -e "${GREEN}Cleanup complete${NC}"
 }
 
-# Handle Ctrl+C - set flag and let main loop handle it
-handle_sigint() {
-    echo -e "\n${YELLOW}Ctrl+C pressed - saving checkpoint and exiting...${NC}"
-    USER_EXIT_REQUESTED=true
-}
+trap cleanup EXIT INT TERM
 
-# Set up trap for SIGINT (Ctrl+C) - don't cleanup yet, just set flag
-trap handle_sigint SIGINT
+# ============================================
+# Pre-cleanup: kill any orphaned processes
+# ============================================
+echo -e "${BLUE}Checking for orphaned processes...${NC}"
+orphans=$(pgrep -f "train_ou.py" 2>/dev/null | wc -l)
+if [ "$orphans" -gt 0 ]; then
+    echo -e "${YELLOW}Killing $orphans orphaned training processes...${NC}"
+    pkill -9 -f "train_ou.py" 2>/dev/null || true
+    sleep 2
+fi
 
-# Cleanup on actual exit
-trap cleanup EXIT
+# Kill any processes on our ports
+for port in $(seq $BASE_PORT $((BASE_PORT + TOTAL_SERVERS - 1))); do
+    pid=$(lsof -ti:$port 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+        echo -e "${YELLOW}Killing process on port $port${NC}"
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+done
+sleep 1
 
-# Function to start Pokemon Showdown servers
-start_servers() {
-    echo -e "${BLUE}Starting $NUM_SERVERS Pokemon Showdown servers...${NC}"
-
-    if [ ! -d "$PS_DIR" ]; then
-        echo -e "${RED}Error: Pokemon Showdown not found at $PS_DIR${NC}"
-        echo "Clone it with: git clone https://github.com/smogon/pokemon-showdown.git ~/pokemon-showdown"
-        exit 1
+# ============================================
+# Migrate old checkpoints if needed
+# Old path: data/checkpoints/ou/joint/worker_X/joint/ or data/checkpoints/ou/joint/joint/
+# New path: data/checkpoints/ou/worker_X/joint/ or data/checkpoints/ou/joint/
+# ============================================
+OLD_CHECKPOINT_BASE="data/checkpoints/ou/joint"
+if [ -d "$OLD_CHECKPOINT_BASE" ]; then
+    # Check for single-worker old path (double nested joint)
+    if [ -d "$OLD_CHECKPOINT_BASE/joint" ] && [ ! -L "$OLD_CHECKPOINT_BASE/joint" ]; then
+        # Old single worker checkpoints at data/checkpoints/ou/joint/joint/ - nothing to do
+        # These will be found by the fallback logic
+        :
     fi
 
-    cd "$PS_DIR"
+    # Check for multi-worker old paths
+    for old_worker_dir in "$OLD_CHECKPOINT_BASE"/worker_*/joint; do
+        if [ -d "$old_worker_dir" ]; then
+            # Extract worker number
+            worker_num=$(basename "$(dirname "$old_worker_dir")" | sed 's/worker_//')
+            new_worker_dir="data/checkpoints/ou/worker_$worker_num/joint"
 
-    for i in $(seq 0 $((NUM_SERVERS - 1))); do
+            if [ ! -d "$new_worker_dir" ]; then
+                echo -e "${YELLOW}Migrating old checkpoints: $old_worker_dir -> $new_worker_dir${NC}"
+                mkdir -p "$(dirname "$new_worker_dir")"
+                mv "$old_worker_dir" "$new_worker_dir"
+            fi
+        fi
+    done
+fi
+
+# ============================================
+# Print config
+# ============================================
+echo -e "${GREEN}======================================${NC}"
+echo -e "${GREEN}  OU Training${NC}"
+echo -e "${GREEN}======================================${NC}"
+echo -e "Mode:         ${BLUE}$MODE${NC}"
+echo -e "Workers:      ${BLUE}$NUM_WORKERS${NC}"
+echo -e "Envs/worker:  ${BLUE}$ENVS_PER_WORKER${NC}"
+echo -e "Total envs:   ${BLUE}$TOTAL_ENVS${NC}"
+echo -e "Device:       ${BLUE}$DEVICE${NC}"
+echo -e "Servers:      ${BLUE}$TOTAL_SERVERS${NC} (ports $BASE_PORT-$((BASE_PORT + TOTAL_SERVERS - 1)))"
+if [ "$MODE" = "joint" ]; then
+    echo -e "Curriculum:   ${BLUE}$CURRICULUM${NC}"
+fi
+echo -e "${GREEN}======================================${NC}"
+echo ""
+
+# ============================================
+# Check Pokemon Showdown exists
+# ============================================
+if [ ! -d "$PS_DIR" ]; then
+    echo -e "${RED}Error: Pokemon Showdown not found at $PS_DIR${NC}"
+    echo "Install with:"
+    echo "  git clone https://github.com/smogon/pokemon-showdown.git ~/pokemon-showdown"
+    echo "  cd ~/pokemon-showdown && npm install"
+    exit 1
+fi
+
+# ============================================
+# Start Pokemon Showdown servers
+# ============================================
+echo -e "${BLUE}Starting $TOTAL_SERVERS Pokemon Showdown servers...${NC}"
+cd "$PS_DIR"
+for i in $(seq 0 $((TOTAL_SERVERS - 1))); do
+    port=$((BASE_PORT + i))
+    node pokemon-showdown start --no-security --port $port > /dev/null 2>&1 &
+    SERVER_PIDS+=($!)
+    sleep 0.5  # Stagger server starts
+done
+cd "$PROJECT_DIR"
+
+# Wait for all servers to be ready
+echo -e "${BLUE}Waiting for servers to initialize...${NC}"
+for attempt in $(seq 1 30); do
+    ready=0
+    for i in $(seq 0 $((TOTAL_SERVERS - 1))); do
         port=$((BASE_PORT + i))
-
-        # Check if port is already in use
         if lsof -ti:$port >/dev/null 2>&1; then
-            echo -e "${YELLOW}Port $port already in use, killing existing process${NC}"
-            kill $(lsof -ti:$port) 2>/dev/null || true
-            sleep 1
-        fi
-
-        echo -e "${GREEN}Starting server on port $port${NC}"
-        node pokemon-showdown start --no-security --port $port > /dev/null 2>&1 &
-        SERVER_PIDS+=($!)
-        sleep 0.5  # Brief pause between server starts
-    done
-
-    # Wait for servers to be ready
-    echo -e "${BLUE}Waiting for servers to initialize...${NC}"
-    sleep 3
-
-    # Verify servers are running
-    for i in $(seq 0 $((NUM_SERVERS - 1))); do
-        port=$((BASE_PORT + i))
-        if ! lsof -ti:$port >/dev/null 2>&1; then
-            echo -e "${RED}Warning: Server on port $port may not have started${NC}"
+            ready=$((ready + 1))
         fi
     done
-
-    echo -e "${GREEN}All servers started${NC}"
-}
-
-# Build server ports argument
-build_ports_arg() {
-    local ports=""
-    for i in $(seq 0 $((NUM_SERVERS - 1))); do
-        port=$((BASE_PORT + i))
-        ports="$ports $port"
-    done
-    echo $ports
-}
-
-# Main training loop
-main() {
-    echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}  Pokemon Showdown OU Training Script${NC}"
-    echo -e "${GREEN}========================================${NC}"
-    echo ""
-    echo -e "Mode: ${BLUE}$MODE${NC}"
-    echo -e "Servers: ${BLUE}$NUM_SERVERS${NC} (ports $BASE_PORT-$((BASE_PORT + NUM_SERVERS - 1)))"
-    echo -e "Environments: ${BLUE}$NUM_ENVS${NC}"
-    echo -e "Steps per run: ${BLUE}$TIMESTEPS${NC}"
-    if [ "$MODE" = "joint" ]; then
-        echo -e "Curriculum: ${BLUE}$CURRICULUM${NC}"
+    if [ "$ready" -eq "$TOTAL_SERVERS" ]; then
+        echo -e "${GREEN}All $TOTAL_SERVERS servers ready${NC}"
+        break
     fi
-    echo ""
-
-    # Start servers
-    start_servers
-
-    cd "$PROJECT_DIR"
-
-    # Activate virtual environment
-    if [ -f ".venv-rocm/bin/activate" ]; then
-        source .venv-rocm/bin/activate
-    elif [ -f ".venv/bin/activate" ]; then
-        source .venv/bin/activate
-    else
-        echo -e "${RED}No virtual environment found${NC}"
+    if [ "$attempt" -eq 30 ]; then
+        echo -e "${RED}Error: Only $ready/$TOTAL_SERVERS servers started${NC}"
+        echo -e "${RED}Check if Pokemon Showdown is installed correctly${NC}"
         exit 1
     fi
+    sleep 1
+done
 
-    PORTS=$(build_ports_arg)
-    RUN_COUNT=0
+# ============================================
+# Activate virtual environment
+# ============================================
+if [ -f ".venv-rocm/bin/activate" ]; then
+    source .venv-rocm/bin/activate
+elif [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+fi
 
-    # Set checkpoint directory based on mode
-    if [ "$MODE" = "joint" ]; then
-        CHECKPOINT_DIR="data/checkpoints/ou/joint"
-    elif [ "$MODE" = "teambuilder" ]; then
-        CHECKPOINT_DIR="data/checkpoints/ou/teambuilder"
-    else
-        CHECKPOINT_DIR="data/checkpoints/ou"
-    fi
+# Create directories
+mkdir -p "$CHECKPOINT_RESUME_DIR" logs
 
-    BEST_MODEL="$CHECKPOINT_DIR/best_model.pt"
-    LATEST_MODEL="$CHECKPOINT_DIR/latest.pt"
+# ============================================
+# Check for checkpoint to resume from (prefer best_model.pt)
+# Also check old nested path for backward compatibility
+# ============================================
+RESUME_ARG=""
+OLD_NESTED_DIR="$CHECKPOINT_RESUME_DIR/joint"  # Old buggy path had double /joint
 
-    # Training loop - continues until Ctrl+C
-    while true; do
-        # Check if user requested exit before starting new run
-        if [ "$USER_EXIT_REQUESTED" = true ]; then
-            echo -e "${GREEN}User requested stop. Exiting...${NC}"
-            break
-        fi
+if [ -f "$CHECKPOINT_RESUME_DIR/best_model.pt" ]; then
+    echo -e "${BLUE}Resuming from: $CHECKPOINT_RESUME_DIR/best_model.pt${NC}"
+    RESUME_ARG="--resume $CHECKPOINT_RESUME_DIR/best_model.pt"
+elif [ -f "$CHECKPOINT_RESUME_DIR/player_model.pt" ]; then
+    echo -e "${BLUE}Resuming from: $CHECKPOINT_RESUME_DIR/player_model.pt${NC}"
+    RESUME_ARG="--resume $CHECKPOINT_RESUME_DIR/player_model.pt"
+elif [ -f "$OLD_NESTED_DIR/best_model.pt" ]; then
+    echo -e "${BLUE}Resuming from (old path): $OLD_NESTED_DIR/best_model.pt${NC}"
+    RESUME_ARG="--resume $OLD_NESTED_DIR/best_model.pt"
+elif [ -f "$OLD_NESTED_DIR/player_model.pt" ]; then
+    echo -e "${BLUE}Resuming from (old path): $OLD_NESTED_DIR/player_model.pt${NC}"
+    RESUME_ARG="--resume $OLD_NESTED_DIR/player_model.pt"
+elif [ -d "$OLD_NESTED_DIR" ] && [ "$(ls -A $OLD_NESTED_DIR 2>/dev/null)" ]; then
+    echo -e "${BLUE}Resuming from (old path): $OLD_NESTED_DIR${NC}"
+    RESUME_ARG="--resume $OLD_NESTED_DIR"
+elif [ -d "$CHECKPOINT_RESUME_DIR" ] && [ "$(ls -A $CHECKPOINT_RESUME_DIR 2>/dev/null)" ]; then
+    echo -e "${BLUE}Resuming from: $CHECKPOINT_RESUME_DIR (directory)${NC}"
+    RESUME_ARG="--resume $CHECKPOINT_RESUME_DIR"
+else
+    echo -e "${YELLOW}No checkpoint found, starting fresh${NC}"
+fi
+echo ""
 
-        RUN_COUNT=$((RUN_COUNT + 1))
-        echo ""
-        echo -e "${GREEN}========================================${NC}"
-        echo -e "${GREEN}  Starting OU training run #$RUN_COUNT${NC}"
-        echo -e "${GREEN}========================================${NC}"
+# ============================================
+# Start training worker(s)
+# ============================================
+echo -e "${BLUE}Starting $NUM_WORKERS training worker(s)...${NC}"
+echo ""
 
-        # Determine resume argument
-        RESUME_ARG=""
-        if [ -f "$LATEST_MODEL" ]; then
-            CHECKPOINT_INFO=$(python -c "
-import torch
-cp = torch.load('$LATEST_MODEL', map_location='cpu', weights_only=False)
-steps = cp.get('total_timesteps', 0)
-print(f'Steps: {steps:,}')
-" 2>/dev/null || echo "Unable to read checkpoint info")
-            echo -e "${BLUE}Resuming from: latest.pt${NC}"
-            echo -e "${BLUE}  $CHECKPOINT_INFO${NC}"
-            RESUME_ARG="--resume"
-        elif [ -f "$BEST_MODEL" ]; then
-            echo -e "${BLUE}Resuming from: best_model.pt${NC}"
-            RESUME_ARG="--resume $BEST_MODEL"
-        else
-            echo -e "${YELLOW}No checkpoint found, starting fresh${NC}"
-        fi
-        echo ""
-
-        # Build training command
-        TRAIN_CMD="python scripts/train_ou.py \
-            --mode $MODE \
-            $RESUME_ARG \
-            --num-envs $NUM_ENVS \
-            --server-ports $PORTS \
-            --timesteps $TIMESTEPS"
-
-        # Add curriculum for joint mode
-        if [ "$MODE" = "joint" ]; then
-            TRAIN_CMD="$TRAIN_CMD --curriculum $CURRICULUM"
-        fi
-
-        # Run training
-        # Exit code 0 = normal completion (including memory soft limit)
-        # Exit code 130 = SIGINT (Ctrl+C)
-        set +e  # Don't exit on error
-        eval $TRAIN_CMD
-        EXIT_CODE=$?
-        set -e
-
-        echo ""
-        echo -e "${YELLOW}Training exited with code: $EXIT_CODE${NC}"
-
-        # Check if user requested exit via Ctrl+C (either to script or passed through)
-        if [ "$USER_EXIT_REQUESTED" = true ] || [ $EXIT_CODE -eq 130 ] || [ $EXIT_CODE -eq 2 ]; then
-            echo -e "${GREEN}User requested stop. Exiting...${NC}"
-            break
-        elif [ $EXIT_CODE -eq 0 ]; then
-            # Normal completion or memory soft limit
-            echo -e "${BLUE}Run completed. Starting next run...${NC}"
-            sleep 2
-        else
-            # Some other error
-            echo -e "${YELLOW}Training exited unexpectedly. Restarting in 5 seconds...${NC}"
-            sleep 5
-        fi
+for worker in $(seq 0 $((NUM_WORKERS - 1))); do
+    # Calculate ports for this worker
+    start_port=$((BASE_PORT + worker * SERVERS_PER_WORKER))
+    ports=""
+    for s in $(seq 0 $((SERVERS_PER_WORKER - 1))); do
+        ports="$ports $((start_port + s))"
     done
 
-    echo ""
-    echo -e "${GREEN}OU Training session ended after $RUN_COUNT run(s)${NC}"
-}
+    # Worker-specific paths for multi-worker
+    if [ "$NUM_WORKERS" -gt 1 ]; then
+        worker_checkpoint="$CHECKPOINT_DIR/worker_$worker"
+        worker_log="$LOG_DIR/worker_$worker"
+        mkdir -p "$worker_checkpoint"
+    else
+        worker_checkpoint="$CHECKPOINT_DIR"
+        worker_log="$LOG_DIR"
+    fi
 
-# Run main
-main "$@"
+    # Build command
+    CMD="python scripts/train_ou.py \
+        --mode $MODE \
+        --num-envs $ENVS_PER_WORKER \
+        --server-ports $ports \
+        --timesteps $TIMESTEPS \
+        --checkpoint-dir $worker_checkpoint \
+        --log-dir $worker_log \
+        --device $DEVICE"
+
+    if [ "$MODE" = "joint" ]; then
+        CMD="$CMD --curriculum $CURRICULUM"
+    fi
+
+    # Resume logic: single worker uses global RESUME_ARG, multi-worker auto-resumes
+    if [ "$NUM_WORKERS" -eq 1 ] && [ -n "$RESUME_ARG" ]; then
+        CMD="$CMD $RESUME_ARG"
+    elif [ "$NUM_WORKERS" -gt 1 ]; then
+        # Each worker auto-resumes from its own checkpoint directory
+        CMD="$CMD --resume auto"
+    fi
+
+    # Start worker
+    if [ "$NUM_WORKERS" -eq 1 ]; then
+        # Single worker: run in foreground so Ctrl+C works properly
+        # Tee to log file for monitoring (unbuffered for real-time updates)
+        echo -e "${GREEN}Training started. Press Ctrl+C to stop.${NC}"
+        echo -e "Monitor in another terminal: ${BLUE}tail -f logs/ou_worker_0.log${NC}"
+        echo ""
+        set +e
+        eval "stdbuf -oL $CMD" 2>&1 | tee logs/ou_worker_0.log
+        EXIT_CODE=${PIPESTATUS[0]}
+        set -e
+        echo -e "${YELLOW}Training exited with code: $EXIT_CODE${NC}"
+    else
+        # Multiple workers: run in background
+        eval "$CMD" > "logs/ou_worker_$worker.log" 2>&1 &
+        WORKER_PIDS+=($!)
+        echo -e "${CYAN}Worker $worker started (PID: ${WORKER_PIDS[-1]}, ports:$ports)${NC}"
+    fi
+done
+
+# ============================================
+# For multi-worker, monitor and wait
+# ============================================
+if [ "$NUM_WORKERS" -gt 1 ]; then
+    echo ""
+    echo -e "${GREEN}All workers started!${NC}"
+    echo -e "Logs: ${BLUE}logs/ou_worker_*.log${NC}"
+    echo -e "Monitor: ${BLUE}tail -f logs/ou_worker_0.log${NC}"
+    echo ""
+    echo "Press Ctrl+C to stop all workers."
+    echo ""
+
+    # Wait for workers
+    while true; do
+        alive=0
+        for pid in "${WORKER_PIDS[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                alive=$((alive + 1))
+            fi
+        done
+
+        if [ $alive -eq 0 ]; then
+            echo -e "\n${GREEN}All workers completed${NC}"
+            break
+        fi
+
+        # Show brief status
+        echo -ne "\r${BLUE}Workers running: $alive/$NUM_WORKERS${NC}  "
+        sleep 5
+    done
+fi
+
+echo -e "${GREEN}Training complete${NC}"

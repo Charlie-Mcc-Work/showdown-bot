@@ -10,8 +10,10 @@ set -e
 # Configuration (defaults)
 NUM_SERVERS=3
 BASE_PORT=8000
-NUM_ENVS=12  # Should be multiple of NUM_SERVERS for even distribution
+NUM_ENVS=8  # Sweet spot for single GPU - more envs adds overhead
 TIMESTEPS=5000000  # 5M steps per run
+DEVICE="cuda"  # Use GPU by default
+NUM_WORKERS=1  # Number of distributed workers (gradient sharing)
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -28,13 +30,28 @@ while [[ $# -gt 0 ]]; do
             TIMESTEPS="$2"
             shift 2
             ;;
+        --device)
+            DEVICE="$2"
+            shift 2
+            ;;
+        --workers|-w)
+            NUM_WORKERS="$2"
+            shift 2
+            ;;
         -h|--help)
             echo "Usage: $0 [options]"
             echo "Options:"
-            echo "  --num-envs N      Number of parallel environments (default: 12)"
+            echo "  --num-envs N      Environments per worker (default: 12)"
             echo "  --num-servers N   Number of PS servers to start (default: 3)"
+            echo "  --workers N       Number of distributed workers with gradient sharing (default: 1)"
             echo "  --timesteps N     Steps per training run (default: 5000000)"
+            echo "  --device DEV      Device: cuda, cpu (default: cuda)"
             echo "  -h, --help        Show this help"
+            echo ""
+            echo "Examples:"
+            echo "  $0                           # Single worker, 12 envs"
+            echo "  $0 --workers 4 --num-envs 6  # 4 workers x 6 envs = 24 parallel battles"
+            echo "                               # All workers share gradients (true scaling)"
             exit 0
             ;;
         *)
@@ -43,6 +60,16 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Auto-scale servers based on total envs (1 server per 4 envs, minimum 3)
+TOTAL_ENVS=$((NUM_WORKERS * NUM_ENVS))
+AUTO_SERVERS=$(( (TOTAL_ENVS + 3) / 4 ))
+[ "$AUTO_SERVERS" -lt 3 ] && AUTO_SERVERS=3
+# Use auto-scaled value if user didn't explicitly set --num-servers
+if [ "$NUM_SERVERS" -eq 3 ] && [ "$AUTO_SERVERS" -gt 3 ]; then
+    NUM_SERVERS=$AUTO_SERVERS
+fi
+
 PS_DIR="$HOME/pokemon-showdown"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -157,7 +184,10 @@ main() {
     echo -e "${GREEN}========================================${NC}"
     echo ""
     echo -e "Servers: ${BLUE}$NUM_SERVERS${NC} (ports $BASE_PORT-$((BASE_PORT + NUM_SERVERS - 1)))"
-    echo -e "Environments: ${BLUE}$NUM_ENVS${NC}"
+    echo -e "Workers: ${BLUE}$NUM_WORKERS${NC} (gradient sharing)"
+    echo -e "Envs/worker: ${BLUE}$NUM_ENVS${NC}"
+    echo -e "Total battles: ${BLUE}$((NUM_WORKERS * NUM_ENVS))${NC}"
+    echo -e "Device: ${BLUE}$DEVICE${NC}"
     echo -e "Steps per run: ${BLUE}$TIMESTEPS${NC}"
     echo ""
 
@@ -250,13 +280,30 @@ print(f'Steps: {steps:,} | Skill: {skill:.0f}')
         # Run training
         # Exit code 0 = normal completion (including memory soft limit)
         # Exit code 130 = SIGINT (Ctrl+C)
+        mkdir -p logs
         set +e  # Don't exit on error
-        python scripts/train.py \
-            $RESUME_ARG \
-            --num-envs $NUM_ENVS \
-            --server-ports $PORTS \
-            --timesteps $TIMESTEPS
-        EXIT_CODE=$?
+        if [ "$NUM_WORKERS" -gt 1 ]; then
+            # Distributed training with gradient sharing
+            # Tee to log file for monitoring (unbuffered for real-time updates)
+            stdbuf -oL torchrun --nproc_per_node=$NUM_WORKERS \
+                scripts/train_distributed.py \
+                $RESUME_ARG \
+                --num-envs $NUM_ENVS \
+                --server-ports $PORTS \
+                --timesteps $TIMESTEPS \
+                --device $DEVICE 2>&1 | tee logs/worker_0.log
+            EXIT_CODE=${PIPESTATUS[0]}
+        else
+            # Single worker training
+            # Tee to log file for monitoring (unbuffered for real-time updates)
+            stdbuf -oL python -u scripts/train.py \
+                $RESUME_ARG \
+                --num-envs $NUM_ENVS \
+                --server-ports $PORTS \
+                --timesteps $TIMESTEPS \
+                --device $DEVICE 2>&1 | tee logs/worker_0.log
+            EXIT_CODE=${PIPESTATUS[0]}
+        fi
         set -e
 
         echo ""

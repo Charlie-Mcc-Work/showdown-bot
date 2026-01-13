@@ -1,6 +1,10 @@
 # Pokemon Showdown RL Bot
 
-A reinforcement learning bot that plays Pokemon Showdown Gen 9 Random Battles using self-play training.
+A reinforcement learning bot for Pokemon Showdown using PPO and self-play training.
+
+**Supports:**
+- **Gen 9 Random Battles** - Battle training with self-play
+- **Gen 9 OU** - Joint player + teambuilder training with curriculum learning
 
 ## Quick Start: Play Against the Bot
 
@@ -103,64 +107,78 @@ The server runs on `localhost:8000` by default.
 
 ## Training
 
-### Recommended: Automated Training Script
-
-The easiest way to train is with the automated script that handles everything:
+### Quick Reference
 
 ```bash
+# Random Battles (just run this)
 ./scripts/run_training.sh
+
+# OU Joint Training - player + teambuilder together (just run this)
+./scripts/run_training_ou.sh
+
+# OU Player-only - faster, uses sample teams
+./scripts/run_training_ou.sh --mode player
 ```
 
-This script:
-- Starts multiple Pokemon Showdown servers automatically
-- Runs training with parallel environments distributed across servers
-- Auto-resumes from the best checkpoint
-- Restarts automatically on memory issues or run completion (5M steps per run)
-- Ctrl+C gracefully saves checkpoint and exits
+All scripts automatically:
+- Start Pokemon Showdown servers
+- Resume from checkpoint
+- Save on Ctrl+C
+- Use optimal settings (8 parallel environments)
 
-**Options:**
-```bash
-./scripts/run_training.sh --help                    # Show all options
-./scripts/run_training.sh --num-envs 15             # Use 15 parallel environments
-./scripts/run_training.sh --num-servers 6           # Use 6 PS servers
-./scripts/run_training.sh --timesteps 1000000       # 1M steps per run
-```
-
-### Manual Training
-
-For more control, run training manually:
+### Monitoring Progress
 
 ```bash
-# Terminal 1: Start Pokemon Showdown server
-cd ~/pokemon-showdown && node pokemon-showdown start --no-security
+# In another terminal - live stats
+./scripts/monitor_training.sh
 
-# Terminal 2: Run training
-source .venv/bin/activate  # or .venv-rocm/bin/activate for ROCm
-python scripts/train.py
+# Or just watch the log
+tail -f logs/worker_0.log        # Random battles
+tail -f logs/ou_worker_0.log     # OU training
+
+# TensorBoard for detailed metrics
+tensorboard --logdir runs/
 ```
 
-### Training Commands
+### Training Speed Reference
 
-| Command | Description |
-|---------|-------------|
-| `python scripts/train.py` | Start fresh training (default: 10M steps, 8 envs) |
-| `python scripts/train.py --resume` | Resume from latest checkpoint |
-| `python scripts/train.py --resume path/to/checkpoint.pt` | Resume from specific checkpoint |
-| `python scripts/train.py -t 100000` | Train for 100k steps |
-| `python scripts/train.py --num-envs 4` | Use 4 parallel environments |
-| `python scripts/train.py --server-ports 8000 8001 8002` | Use multiple servers |
-| `python scripts/train.py --no-self-play` | Train against random opponents only |
+| Mode | Speed | What's Training |
+|------|-------|-----------------|
+| Random Battles | ~215 it/s | Player network |
+| OU Player-only | ~150 it/s | Player network (with OU mechanics) |
+| OU Joint | ~60 it/s | Player + Teambuilder networks together |
+
+### Options
+
+```bash
+# Random Battles
+./scripts/run_training.sh --help
+./scripts/run_training.sh --num-envs 6      # Fewer envs (less memory)
+./scripts/run_training.sh --timesteps 1M    # Steps per run
+
+# OU Training
+./scripts/run_training_ou.sh --help
+./scripts/run_training_ou.sh --mode player  # Player-only (faster)
+./scripts/run_training_ou.sh --mode joint   # Joint training (default)
+./scripts/run_training_ou.sh --num-envs 6   # Fewer envs
+```
 
 ### Stopping Training
 
 - **Ctrl+C**: Graceful shutdown - saves checkpoint and exits cleanly
-- **Kill/crash**: `latest.pt` is updated on every periodic save, so resume will work
+- Training auto-resumes from checkpoint on next run
 
-### Monitoring
+### Manual Training (Advanced)
+
+For more control, run training scripts directly:
 
 ```bash
-# View training metrics in TensorBoard
-tensorboard --logdir runs/
+# Start Pokemon Showdown server manually
+cd ~/pokemon-showdown && node pokemon-showdown start --no-security
+
+# Run training
+python scripts/train.py                    # Random battles
+python scripts/train_ou.py --mode joint    # OU joint training
 ```
 
 ---

@@ -10,11 +10,15 @@ This module handles:
 import json
 import logging
 import re
+import subprocess
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# Pokemon Showdown installation path for validation
+PS_PATH = Path.home() / "pokemon-showdown"
 
 logger = logging.getLogger(__name__)
 
@@ -741,11 +745,12 @@ class TeamLoader:
         self.teams_dir = Path(teams_dir) if teams_dir else Path("data/sample_teams")
         self.teams: list[Team] = []
 
-    def load_teams(self, format: str = "gen9ou") -> list[Team]:
+    def load_teams(self, format: str = "gen9ou", validate: bool = True) -> list[Team]:
         """Load all teams for a format.
 
         Args:
             format: The format to load teams for
+            validate: If True, validate teams and filter out invalid ones
 
         Returns:
             List of Team objects
@@ -763,7 +768,7 @@ class TeamLoader:
                     for team_data in data:
                         self.teams.append(self._parse_team(team_data, format))
             except Exception as e:
-                print(f"Warning: Failed to load {team_file}: {e}")
+                logger.warning(f"Failed to load {team_file}: {e}")
 
         # Load from Showdown paste format
         for paste_file in self.teams_dir.glob(f"{format}*.txt"):
@@ -771,9 +776,125 @@ class TeamLoader:
                 teams = self._parse_showdown_paste(paste_file, format)
                 self.teams.extend(teams)
             except Exception as e:
-                print(f"Warning: Failed to load {paste_file}: {e}")
+                logger.warning(f"Failed to load {paste_file}: {e}")
+
+        # Validate teams if requested
+        if validate and self.teams:
+            valid_teams = []
+            for team in self.teams:
+                is_valid, error = self.validate_team(team, format)
+                if is_valid:
+                    valid_teams.append(team)
+                else:
+                    team_name = team.name or f"team with {team.pokemon[0].species if team.pokemon else 'unknown'}"
+                    logger.warning(f"Skipping invalid team '{team_name}': {error}")
+
+            if len(valid_teams) < len(self.teams):
+                logger.info(f"Validated {len(valid_teams)}/{len(self.teams)} teams for {format}")
+
+            self.teams = valid_teams
 
         return self.teams
+
+    def validate_team(self, team: Team, format: str = "gen9ou") -> tuple[bool, str]:
+        """Validate a team using Pokemon Showdown's validator.
+
+        Args:
+            team: Team to validate
+            format: Battle format (e.g., 'gen9ou')
+
+        Returns:
+            (is_valid, error_message) tuple
+        """
+        if not PS_PATH.exists():
+            # Can't validate without PS, assume valid
+            logger.debug(f"Pokemon Showdown not found at {PS_PATH}, skipping validation")
+            return True, ""
+
+        # Convert team to paste format
+        team_paste = self._team_to_paste(team)
+
+        cmd = [str(PS_PATH / "pokemon-showdown"), "validate-team", format]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                input=team_paste,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=PS_PATH,
+            )
+
+            # Empty output means valid
+            if not result.stdout.strip() and result.returncode == 0:
+                return True, ""
+
+            # Output contains validation errors
+            return False, result.stdout.strip() or result.stderr.strip()
+
+        except subprocess.TimeoutExpired:
+            return False, "Validation timed out"
+        except FileNotFoundError:
+            return True, ""  # Can't validate, assume valid
+        except Exception as e:
+            logger.debug(f"Validation error: {e}")
+            return True, ""  # Can't validate, assume valid
+
+    def _team_to_paste(self, team: Team) -> str:
+        """Convert a Team to Pokemon Showdown paste format."""
+        lines = []
+
+        for pokemon in team.pokemon:
+            # Species @ Item
+            if pokemon.nickname:
+                line = f"{pokemon.nickname} ({pokemon.species})"
+            else:
+                line = pokemon.species
+
+            if pokemon.item:
+                line += f" @ {pokemon.item}"
+            lines.append(line)
+
+            # Ability
+            if pokemon.ability:
+                lines.append(f"Ability: {pokemon.ability}")
+
+            # Tera Type
+            if pokemon.tera_type:
+                lines.append(f"Tera Type: {pokemon.tera_type}")
+
+            # EVs
+            if pokemon.evs:
+                ev_parts = []
+                stat_names = {"hp": "HP", "atk": "Atk", "def": "Def", "spa": "SpA", "spd": "SpD", "spe": "Spe"}
+                for stat, val in pokemon.evs.items():
+                    if val > 0:
+                        ev_parts.append(f"{val} {stat_names.get(stat, stat)}")
+                if ev_parts:
+                    lines.append(f"EVs: {' / '.join(ev_parts)}")
+
+            # Nature
+            if pokemon.nature:
+                lines.append(f"{pokemon.nature} Nature")
+
+            # IVs
+            if pokemon.ivs:
+                iv_parts = []
+                stat_names = {"hp": "HP", "atk": "Atk", "def": "Def", "spa": "SpA", "spd": "SpD", "spe": "Spe"}
+                for stat, val in pokemon.ivs.items():
+                    if val != 31:
+                        iv_parts.append(f"{val} {stat_names.get(stat, stat)}")
+                if iv_parts:
+                    lines.append(f"IVs: {' / '.join(iv_parts)}")
+
+            # Moves
+            for move in pokemon.moves:
+                lines.append(f"- {move}")
+
+            lines.append("")  # Empty line between Pokemon
+
+        return "\n".join(lines)
 
     def _parse_team(self, data: dict, format: str) -> Team:
         """Parse a team from JSON format."""

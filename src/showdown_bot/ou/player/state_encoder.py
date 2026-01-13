@@ -416,7 +416,7 @@ class OUStateEncoder:
         Returns:
             BattleOrder or None if action is invalid
         """
-        from poke_env.player.battle_order import BattleOrder
+        from poke_env.player.battle_order import SingleBattleOrder
 
         # During forced switch, only switch actions are valid
         if battle.force_switch:
@@ -430,7 +430,7 @@ class OUStateEncoder:
             available_moves = battle.available_moves
             if action < len(available_moves):
                 move = available_moves[action]
-                return BattleOrder(move)
+                return SingleBattleOrder(order=move)
 
         elif action < 8:
             # Tera move action (same moves but with tera)
@@ -439,10 +439,10 @@ class OUStateEncoder:
 
             if move_idx < len(available_moves) and battle.can_tera:
                 move = available_moves[move_idx]
-                return BattleOrder(move, terastallize=True)
+                return SingleBattleOrder(order=move, terastallize=True)
             elif move_idx < len(available_moves):
                 # Can't tera, fall back to regular move
-                return BattleOrder(available_moves[move_idx])
+                return SingleBattleOrder(order=available_moves[move_idx])
 
         else:
             # Switch action (8-12 -> switch to team slot 0-4)
@@ -454,6 +454,6 @@ class OUStateEncoder:
                 if pokemon in team_list:
                     idx = team_list.index(pokemon)
                     if idx == switch_idx:
-                        return BattleOrder(pokemon)
+                        return SingleBattleOrder(order=pokemon)
 
         return None
