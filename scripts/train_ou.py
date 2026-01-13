@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import torch
 from poke_env.player import RandomPlayer
+from poke_env.ps_client import ServerConfiguration
 from torch.utils.tensorboard import SummaryWriter
 
 from showdown_bot.ou.player.network import OUPlayerNetwork
@@ -91,11 +92,25 @@ class OUTrainingManager:
         log_dir: str = "runs/ou",
         num_envs: int = 1,
         use_self_play: bool = True,
+        server_ports: list[int] | None = None,
     ):
         self.config = config
         self.device = device
         self.num_envs = num_envs
         self.use_self_play = use_self_play
+
+        # Server configurations for multi-server support
+        if server_ports:
+            self.server_configs = [
+                ServerConfiguration(
+                    websocket_url=f"ws://localhost:{port}/showdown/websocket",
+                    authentication_url="https://play.pokemonshowdown.com/action.php?",
+                )
+                for port in server_ports
+            ]
+        else:
+            self.server_configs = [None]  # Use default server
+
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -265,6 +280,9 @@ class OUTrainingManager:
 
         import random
         for i in range(self.num_envs):
+            # Distribute players across servers round-robin
+            server_config = self.server_configs[i % len(self.server_configs)]
+
             # Pick a random team for this player
             team = random.choice(self.teams) if self.teams else None
 
@@ -276,13 +294,15 @@ class OUTrainingManager:
                 current_team=team,
                 battle_format="gen9ou",
                 max_concurrent_battles=1,
+                server_configuration=server_config,
             )
             players.append(player)
 
             # Get opponent from self-play manager or baseline
             if self.self_play_manager:
                 opponent, opponent_info, opponent_type = self.self_play_manager.get_opponent(
-                    battle_format="gen9ou"
+                    battle_format="gen9ou",
+                    server_configuration=server_config,
                 )
                 opponents.append(opponent)
                 opponent_infos.append((opponent_info, opponent_type))
@@ -292,6 +312,7 @@ class OUTrainingManager:
                     opponent = RandomPlayer(
                         battle_format="gen9ou",
                         max_concurrent_battles=1,
+                        server_configuration=server_config,
                     )
                     opponent_infos.append((None, "random"))
                 else:
@@ -299,6 +320,7 @@ class OUTrainingManager:
                         teams=self.teams,
                         battle_format="gen9ou",
                         max_concurrent_battles=1,
+                        server_configuration=server_config,
                     )
                     opponent_infos.append((None, "maxdamage"))
                 opponents.append(opponent)
@@ -385,8 +407,17 @@ class OUTrainingManager:
 
         return max(battle.turn, 1), won
 
-    async def _cleanup_players(self, players: list) -> None:
-        """Clean up player connections."""
+    async def _cleanup_players(self, players: list, timeout: float = 5.0) -> None:
+        """Clean up player connections with timeout.
+
+        Args:
+            players: List of players to clean up
+            timeout: Maximum time to wait for cleanup (shorter on shutdown)
+        """
+        # Use shorter timeout if shutdown was requested
+        if self.should_stop:
+            timeout = 2.0
+
         cleanup_tasks = []
         for player in players:
             try:
@@ -396,8 +427,14 @@ class OUTrainingManager:
                 pass
 
         if cleanup_tasks:
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-            await asyncio.sleep(0.5)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                pass  # Continue with memory cleanup even if websockets hang
+            await asyncio.sleep(0.3)
 
         # Free memory
         for player in players:
@@ -789,6 +826,7 @@ class JointTrainingManager:
         log_dir: str = "runs/ou/joint",
         num_envs: int = 1,
         curriculum_strategy: str = "adaptive",
+        server_ports: list[int] | None = None,
     ):
         self.config = config
         self.device = device
@@ -796,6 +834,18 @@ class JointTrainingManager:
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.curriculum_strategy = curriculum_strategy
+
+        # Server configurations for multi-server support
+        if server_ports:
+            self.server_configs = [
+                ServerConfiguration(
+                    websocket_url=f"ws://localhost:{port}/showdown/websocket",
+                    authentication_url="https://play.pokemonshowdown.com/action.php?",
+                )
+                for port in server_ports
+            ]
+        else:
+            self.server_configs = [None]  # Use default server
 
         # Load sample teams for bootstrapping
         logger.info(f"Loading sample teams from {teams_dir}...")
@@ -961,6 +1011,9 @@ class JointTrainingManager:
 
         import random
         for i in range(self.num_envs):
+            # Distribute players across servers round-robin
+            server_config = self.server_configs[i % len(self.server_configs)]
+
             # Get team from joint trainer's pool (uses curriculum)
             team = self.joint_trainer.get_training_team()
             if team is None:
@@ -980,6 +1033,7 @@ class JointTrainingManager:
                 current_team=team,
                 battle_format="gen9ou",
                 max_concurrent_battles=1,
+                server_configuration=server_config,
             )
             players.append(player)
 
@@ -991,12 +1045,14 @@ class JointTrainingManager:
                 opponent = RandomPlayer(
                     battle_format="gen9ou",
                     max_concurrent_battles=1,
+                    server_configuration=server_config,
                 )
             elif opponent_type == OpponentType.MAXDAMAGE:
                 opponent = OUMaxDamagePlayer(
                     teams=self.sample_teams,
                     battle_format="gen9ou",
                     max_concurrent_battles=1,
+                    server_configuration=server_config,
                 )
             else:
                 # SELF_PLAY and others: use maxdamage as placeholder
@@ -1005,6 +1061,7 @@ class JointTrainingManager:
                     teams=self.sample_teams,
                     battle_format="gen9ou",
                     max_concurrent_battles=1,
+                    server_configuration=server_config,
                 )
             opponents.append(opponent)
 
@@ -1096,8 +1153,17 @@ class JointTrainingManager:
 
         return turns, won, turns, opponent_revealed
 
-    async def _cleanup_players(self, players: list) -> None:
-        """Clean up player connections."""
+    async def _cleanup_players(self, players: list, timeout: float = 5.0) -> None:
+        """Clean up player connections with timeout.
+
+        Args:
+            players: List of players to clean up
+            timeout: Maximum time to wait for cleanup (shorter on shutdown)
+        """
+        # Use shorter timeout if shutdown was requested
+        if self.should_stop:
+            timeout = 2.0
+
         cleanup_tasks = []
         for player in players:
             try:
@@ -1107,8 +1173,14 @@ class JointTrainingManager:
                 pass
 
         if cleanup_tasks:
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-            await asyncio.sleep(0.5)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                pass  # Continue with memory cleanup even if websockets hang
+            await asyncio.sleep(0.3)
 
         for player in players:
             if hasattr(player, 'network'):
@@ -1262,6 +1334,16 @@ async def main_async(args: argparse.Namespace) -> None:
     print("  cd ~/pokemon-showdown && node pokemon-showdown start --no-security")
     print("=" * 60 + "\n")
 
+    # Show server info if multi-server
+    if args.server_ports:
+        print(f"Using {len(args.server_ports)} servers on ports: {args.server_ports}")
+        for port in args.server_ports:
+            print(f"  node pokemon-showdown start --no-security --port {port}")
+    else:
+        print("Using 1 server on port: [8000]")
+        print("Make sure the server is running:")
+        print("  node pokemon-showdown start --no-security --port 8000")
+
     if args.mode == "player":
         # Player training mode
         manager = OUTrainingManager(
@@ -1272,6 +1354,7 @@ async def main_async(args: argparse.Namespace) -> None:
             log_dir=args.log_dir,
             num_envs=args.num_envs,
             use_self_play=not args.no_self_play,
+            server_ports=args.server_ports,
         )
 
         # Load checkpoint if resuming
@@ -1343,6 +1426,7 @@ async def main_async(args: argparse.Namespace) -> None:
             log_dir=joint_log_dir,
             num_envs=args.num_envs,
             curriculum_strategy=args.curriculum if args.curriculum != "none" else "adaptive",
+            server_ports=args.server_ports,
         )
 
         if args.resume:
@@ -1433,6 +1517,13 @@ def main() -> None:
         type=int,
         default=1,
         help="Number of parallel environments",
+    )
+    parser.add_argument(
+        "--server-ports",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Pokemon Showdown server ports (for multi-server training)",
     )
     parser.add_argument(
         "--no-self-play",

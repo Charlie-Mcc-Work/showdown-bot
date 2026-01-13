@@ -17,19 +17,54 @@ This module uses a **hybrid approach** where the player and teambuilder are trai
 
 ### Prerequisites
 ```bash
-# 1. Start Pokemon Showdown server (required for all training)
-cd ~/pokemon-showdown && node pokemon-showdown start --no-security
+# Pokemon Showdown must be installed at ~/pokemon-showdown
+git clone https://github.com/smogon/pokemon-showdown.git ~/pokemon-showdown
+cd ~/pokemon-showdown && npm install
 ```
 
 ### Training Commands
 
-**Joint Training (RECOMMENDED)** - Trains player and teambuilder together:
+**Automated Training Script (RECOMMENDED)**
+
+The easiest way to train is with the automated script that handles everything:
 ```bash
-# Basic joint training
+./scripts/run_training_ou.sh
+```
+
+This script:
+- Starts multiple Pokemon Showdown servers automatically
+- Runs joint training with parallel environments distributed across servers
+- Auto-resumes from checkpoint
+- Restarts on memory issues or run completion (5M steps per run)
+- Ctrl+C gracefully saves checkpoint and exits
+
+**Options:**
+```bash
+./scripts/run_training_ou.sh --help                       # Show all options
+./scripts/run_training_ou.sh --num-envs 12                # Use 12 parallel environments
+./scripts/run_training_ou.sh --num-servers 4              # Use 4 PS servers
+./scripts/run_training_ou.sh --timesteps 1000000          # 1M steps per run
+./scripts/run_training_ou.sh --mode player                # Player training only
+./scripts/run_training_ou.sh --curriculum progressive     # Different curriculum strategy
+```
+
+**Manual Training**
+
+For more control, run training manually:
+
+**Joint Training** - Trains player and teambuilder together:
+```bash
+# Terminal 1: Start Pokemon Showdown server
+cd ~/pokemon-showdown && node pokemon-showdown start --no-security
+
+# Terminal 2: Run training
 python scripts/train_ou.py --mode joint
 
 # With parallel environments (faster)
 python scripts/train_ou.py --mode joint --num-envs 4
+
+# Multi-server training (faster with many environments)
+python scripts/train_ou.py --mode joint --num-envs 12 --server-ports 8000 8001 8002
 
 # With specific curriculum strategy
 python scripts/train_ou.py --mode joint --curriculum adaptive   # Default, recommended
@@ -48,6 +83,7 @@ tensorboard --logdir runs/ou/joint/
 ```bash
 python scripts/train_ou.py --mode player          # or just: python scripts/train_ou.py
 python scripts/train_ou.py --mode player --num-envs 4
+python scripts/train_ou.py --mode player --num-envs 12 --server-ports 8000 8001 8002
 ```
 
 **Teambuilder-Only Training** - Train team generation (requires trained player):
@@ -381,6 +417,9 @@ python scripts/train_ou.py --resume
 # Use parallel environments
 python scripts/train_ou.py --num-envs 4
 
+# Multi-server training (faster with many environments)
+python scripts/train_ou.py --num-envs 12 --server-ports 8000 8001 8002
+
 # Disable self-play (random/maxdamage opponents only)
 python scripts/train_ou.py --no-self-play
 
@@ -432,6 +471,9 @@ python scripts/train_ou.py --mode joint
 
 # With parallel environments
 python scripts/train_ou.py --mode joint --num-envs 4
+
+# Multi-server training (faster with many environments)
+python scripts/train_ou.py --mode joint --num-envs 12 --server-ports 8000 8001 8002
 
 # Resume from checkpoint
 python scripts/train_ou.py --mode joint --resume
