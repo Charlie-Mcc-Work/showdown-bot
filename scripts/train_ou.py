@@ -466,11 +466,10 @@ class OUTrainingManager:
                     display.message(f"Saved checkpoint at step {self.total_timesteps:,}")
                     last_save = self.total_timesteps
 
-                # Memory cleanup (less frequent since we reuse players)
-                if self.total_timesteps % 1000 == 0:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                # Memory cleanup - run every iteration to prevent accumulation
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         finally:
             display.close()
@@ -625,12 +624,21 @@ class OUTrainingManager:
                 pass  # Continue with memory cleanup even if websockets hang
             # Removed the 0.3s sleep - not needed for final cleanup
 
-        # Free memory
+        # Free memory - properly delete models and clear battle caches
         for player in players:
-            if hasattr(player, 'network'):
-                player.network = None
+            if hasattr(player, 'network') and player.network is not None:
+                try:
+                    network = player.network
+                    player.network = None
+                    network.cpu()
+                    del network
+                except Exception:
+                    pass
             if hasattr(player, 'state_encoder'):
                 player.state_encoder = None
+            # Clear battle cache to prevent memory accumulation
+            if hasattr(player, '_battles'):
+                player._battles.clear()
 
     async def _evaluate(self, n_games: int = 20) -> dict:
         """Evaluate current policy against baselines.
@@ -1246,11 +1254,10 @@ class JointTrainingManager:
                     display.message(f"Saved checkpoint at step {self.total_timesteps:,}")
                     last_save = self.total_timesteps
 
-                # Memory cleanup (less frequent since we reuse players)
-                if self.total_timesteps % 1000 == 0:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                # Memory cleanup - run every iteration to prevent accumulation
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         finally:
             display.close()
@@ -1418,11 +1425,21 @@ class JointTrainingManager:
                 pass  # Continue with memory cleanup even if websockets hang
             # Removed the 0.3s sleep - not needed for final cleanup
 
+        # Free memory - properly delete models and clear battle caches
         for player in players:
-            if hasattr(player, 'network'):
-                player.network = None
+            if hasattr(player, 'network') and player.network is not None:
+                try:
+                    network = player.network
+                    player.network = None
+                    network.cpu()
+                    del network
+                except Exception:
+                    pass
             if hasattr(player, 'state_encoder'):
                 player.state_encoder = None
+            # Clear battle cache to prevent memory accumulation
+            if hasattr(player, '_battles'):
+                player._battles.clear()
 
     async def _evaluate(self, n_games: int = 20) -> dict:
         """Evaluate current policy against baselines."""

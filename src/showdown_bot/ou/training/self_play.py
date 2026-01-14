@@ -6,6 +6,7 @@ This adapts the random battles self-play system for OU format:
 - Supports skill-matched opponent sampling
 """
 
+import json
 import random
 import logging
 from dataclasses import dataclass
@@ -151,6 +152,7 @@ class OUOpponentPool:
         self.max_size = max_size
         self.device = device or torch.device("cpu")
         self.teams = teams or []
+        self.metadata_path = self.pool_dir / "ou_pool_metadata.json"
 
         self.opponents: list[OUOpponentInfo] = []
         self.state_encoder = OUStateEncoder(device=self.device)
@@ -160,6 +162,9 @@ class OUOpponentPool:
 
     def _load_existing_checkpoints(self) -> None:
         """Load existing checkpoints from the pool directory."""
+        # Load metadata if it exists
+        metadata = self._load_metadata()
+
         for checkpoint_path in sorted(self.pool_dir.glob("ou_opponent_*.pt")):
             # Extract timestep from filename
             try:
@@ -167,14 +172,56 @@ class OUOpponentPool:
             except (IndexError, ValueError):
                 timestep = 0
 
+            # Get saved skill rating from metadata, default to 1000
+            filename = checkpoint_path.name
+            saved_info = metadata.get(filename, {})
+            skill_rating = saved_info.get("skill_rating", 1000.0)
+            games_played = saved_info.get("games_played", 0)
+            wins = saved_info.get("wins", 0)
+            losses = saved_info.get("losses", 0)
+
             self.opponents.append(
                 OUOpponentInfo(
                     checkpoint_path=checkpoint_path,
                     timestep_added=timestep,
+                    skill_rating=skill_rating,
+                    games_played=games_played,
+                    wins=wins,
+                    losses=losses,
                 )
             )
-        if self.opponents:
+        if metadata and self.opponents:
+            avg_skill = sum(o.skill_rating for o in self.opponents) / len(self.opponents)
+            logger.info(f"Loaded {len(self.opponents)} OU opponents (avg skill: {avg_skill:.0f})")
+        elif self.opponents:
             logger.info(f"Loaded {len(self.opponents)} existing OU opponents from pool")
+
+    def _load_metadata(self) -> dict[str, Any]:
+        """Load opponent metadata from JSON file."""
+        if not self.metadata_path.exists():
+            return {}
+        try:
+            with open(self.metadata_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def save_metadata(self) -> None:
+        """Save opponent metadata to JSON file."""
+        metadata = {}
+        for opp in self.opponents:
+            metadata[opp.checkpoint_path.name] = {
+                "skill_rating": opp.skill_rating,
+                "games_played": opp.games_played,
+                "wins": opp.wins,
+                "losses": opp.losses,
+                "timestep_added": opp.timestep_added,
+            }
+        try:
+            with open(self.metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+        except OSError:
+            pass  # Non-critical, will rebuild from defaults
 
     def add_opponent(
         self,
@@ -214,6 +261,9 @@ class OUOpponentPool:
         if len(self.opponents) > self.max_size:
             self._prune_pool()
 
+        # Save metadata after adding
+        self.save_metadata()
+
         return opponent_info
 
     def _prune_pool(self) -> None:
@@ -248,6 +298,9 @@ class OUOpponentPool:
                 logger.debug(f"Pruned opponent: {opponent.checkpoint_path}")
 
         self.opponents = new_opponents
+
+        # Save metadata after pruning
+        self.save_metadata()
 
     def sample_opponent(
         self,
@@ -353,6 +406,11 @@ class OUOpponentPool:
             k_factor,
         )
         opponent_info.skill_rating = new_opponent_skill
+
+        # Save metadata periodically (every 10 games)
+        total_games = sum(o.games_played for o in self.opponents)
+        if total_games % 10 == 0:
+            self.save_metadata()
 
         return new_agent_skill, new_opponent_skill
 

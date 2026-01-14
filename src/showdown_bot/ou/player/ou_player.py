@@ -247,6 +247,9 @@ class OUTrainablePlayer(Player):
         self.episode_lengths = []
         self._rollout_wins = 0
         self._rollout_battles = 0
+        # Clear completed battles to prevent memory accumulation
+        if hasattr(self, '_battles'):
+            self._battles.clear()
 
     def get_rollout_stats(self) -> dict[str, float]:
         """Get stats for the current rollout."""
