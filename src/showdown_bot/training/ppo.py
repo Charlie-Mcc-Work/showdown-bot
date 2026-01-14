@@ -38,6 +38,7 @@ class PPO:
         self,
         model: PolicyValueNetwork,
         learning_rate: float = 3e-4,
+        final_learning_rate: float = 3e-5,
         clip_epsilon: float = 0.2,
         value_coef: float = 0.5,
         entropy_coef: float = 0.01,
@@ -50,7 +51,8 @@ class PPO:
 
         Args:
             model: Policy and value network
-            learning_rate: Learning rate for optimizer
+            learning_rate: Initial learning rate for optimizer
+            final_learning_rate: Final learning rate (for linear decay)
             clip_epsilon: PPO clipping parameter
             value_coef: Value loss coefficient
             entropy_coef: Entropy bonus coefficient
@@ -60,6 +62,8 @@ class PPO:
             device: Device to train on
         """
         self.model = model
+        self.initial_lr = learning_rate
+        self.final_lr = final_learning_rate
         self.clip_epsilon = clip_epsilon
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
@@ -207,6 +211,23 @@ class PPO:
             explained_variance=float(explained_var),
         )
 
+    def update_learning_rate(self, progress: float) -> float:
+        """Update learning rate based on training progress (linear decay).
+
+        Args:
+            progress: Training progress from 0.0 to 1.0
+
+        Returns:
+            The new learning rate
+        """
+        progress = max(0.0, min(1.0, progress))
+        new_lr = self.initial_lr + progress * (self.final_lr - self.initial_lr)
+
+        for param_group in self.optimizer.param_groups:
+            param_group["lr"] = new_lr
+
+        return new_lr
+
     @classmethod
     def from_config(
         cls,
@@ -225,6 +246,7 @@ class PPO:
         return cls(
             model=model,
             learning_rate=cfg.learning_rate,
+            final_learning_rate=cfg.final_learning_rate,
             clip_epsilon=cfg.clip_epsilon,
             value_coef=cfg.value_coef,
             entropy_coef=cfg.entropy_coef,

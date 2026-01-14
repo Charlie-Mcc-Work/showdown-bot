@@ -277,25 +277,53 @@ class OpponentPool:
         return opponent_info
 
     def _prune_pool(self) -> None:
-        """Remove excess opponents, keeping diverse skill levels."""
+        """Remove excess opponents, keeping diverse skill levels and training history.
+
+        Strategy for diversity:
+        1. Keep oldest opponent (weak baseline for confidence)
+        2. Keep newest opponent (most recent checkpoint)
+        3. Keep best opponent (strongest for challenge)
+        4. Keep worst opponent (easy wins for exploration)
+        5. Fill remaining slots with skill-diverse selection
+        """
         if len(self.opponents) <= self.max_size:
             return
 
-        # Sort by skill rating
-        sorted_opponents = sorted(self.opponents, key=lambda x: x.skill_rating)
+        to_keep: set[Path] = set()
 
-        # Keep best, worst, and evenly distributed others
-        to_keep = set()
+        # Sort by different criteria
+        by_skill = sorted(self.opponents, key=lambda x: x.skill_rating)
+        by_time = sorted(self.opponents, key=lambda x: x.timestep_added)
 
-        # Always keep the best and most recent
-        to_keep.add(sorted_opponents[-1].checkpoint_path)
-        to_keep.add(self.opponents[-1].checkpoint_path)
+        # Priority keeps (guaranteed slots)
+        priority_count = min(4, self.max_size)
 
-        # Keep evenly distributed by Elo
-        step = len(sorted_opponents) / (self.max_size - 2)
-        for i in range(self.max_size - 2):
-            idx = int(i * step)
-            to_keep.add(sorted_opponents[idx].checkpoint_path)
+        # 1. Keep oldest (weak baseline)
+        if by_time:
+            to_keep.add(by_time[0].checkpoint_path)
+
+        # 2. Keep newest (most recent)
+        if by_time:
+            to_keep.add(by_time[-1].checkpoint_path)
+
+        # 3. Keep best (strongest)
+        if by_skill:
+            to_keep.add(by_skill[-1].checkpoint_path)
+
+        # 4. Keep worst (easy wins)
+        if by_skill:
+            to_keep.add(by_skill[0].checkpoint_path)
+
+        # 5. Fill remaining slots with skill-diverse selection
+        remaining_slots = self.max_size - len(to_keep)
+        if remaining_slots > 0:
+            # Get opponents not yet kept, spread evenly by skill
+            available = [o for o in by_skill if o.checkpoint_path not in to_keep]
+            if available:
+                step = max(1, len(available) / remaining_slots)
+                for i in range(remaining_slots):
+                    idx = min(int(i * step), len(available) - 1)
+                    to_keep.add(available[idx].checkpoint_path)
 
         # Remove opponents not in to_keep
         new_opponents = []
@@ -319,7 +347,12 @@ class OpponentPool:
         """Sample an opponent from the pool.
 
         Args:
-            strategy: Sampling strategy ("uniform", "skill_matched", "prioritized")
+            strategy: Sampling strategy:
+                - "uniform": Random selection
+                - "skill_matched": Prefer similar skill (can cause echo chamber)
+                - "prioritized": Prefer less-played opponents
+                - "challenge": Prefer stronger opponents (helps learning)
+                - "diverse": Mix of strategies (recommended for training)
             current_skill: Current agent's skill rating for matched sampling
 
         Returns:
@@ -342,6 +375,33 @@ class OpponentPool:
             total = sum(weights)
             weights = [w / total for w in weights]
             return random.choices(self.opponents, weights=weights, k=1)[0]
+
+        elif strategy == "challenge":
+            # Prefer stronger opponents - helps agent learn from better play
+            weights = []
+            for opp in self.opponents:
+                # Higher weight for opponents stronger than us
+                skill_diff = opp.skill_rating - current_skill
+                # Sigmoid-like weighting: strong preference for stronger opponents
+                weight = 1.0 + max(0, skill_diff / 200.0)
+                weights.append(weight)
+
+            total = sum(weights)
+            weights = [w / total for w in weights]
+            return random.choices(self.opponents, weights=weights, k=1)[0]
+
+        elif strategy == "diverse":
+            # Mix of strategies to avoid echo chamber:
+            # - 40% uniform (ensures all opponents get played)
+            # - 30% challenge (learn from stronger opponents)
+            # - 30% skill_matched (practice against similar skill)
+            roll = random.random()
+            if roll < 0.4:
+                return random.choice(self.opponents)
+            elif roll < 0.7:
+                return self.sample_opponent("challenge", current_skill)
+            else:
+                return self.sample_opponent("skill_matched", current_skill)
 
         elif strategy == "prioritized":
             # Prioritize opponents we've played less against
@@ -474,7 +534,7 @@ class SelfPlayManager:
         max_pool_size: int = 10,
         self_play_ratio: float = 0.8,
         checkpoint_interval: int = 50000,
-        sampling_strategy: str = "skill_matched",
+        sampling_strategy: str = "diverse",
         device: torch.device | None = None,
         # Curriculum parameters
         curriculum_enabled: bool = True,

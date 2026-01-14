@@ -99,6 +99,32 @@ python scripts/coach_server.py
 - **Training**: Self-play against historical checkpoints
 - **Action space**: 4 moves + 5 switches (+ tera variants for OU)
 
+## Training Features
+
+### Learning Rate Scheduling
+Linear decay from `3e-4` → `3e-5` over training. Prevents late-stage oscillation.
+
+### Curriculum Opponent Selection
+Opponent mix adjusts based on skill level:
+
+| Stage | Self-Play | MaxDamage | Random |
+|-------|-----------|-----------|--------|
+| Early (<1000 skill) | 20% | 50% | 30% |
+| Late (>6000 skill) | 60% | 40% | 0% |
+
+- **MaxDamage**: Deterministic optimal-damage player, teaches damage calculations
+- **Self-play**: Historical checkpoints with diverse sampling
+- **Random**: Only useful early for learning basics
+
+### Diverse Opponent Sampling
+Self-play uses mixed sampling to avoid echo chambers:
+- 40% uniform (any opponent in pool)
+- 30% challenge (prefer stronger opponents)
+- 30% skill-matched (similar skill level)
+
+### Opponent Pool Diversity
+Pool pruning keeps: oldest (weak baseline), newest, best, worst, plus skill-diverse selection.
+
 ## Technical Notes
 
 - Uses action masking for illegal moves
@@ -106,3 +132,4 @@ python scripts/coach_server.py
 - Browser extension uses `world: "MAIN"` to access PS variables
 - Battle request at `app.curRoom.request` (not `.battle.request`)
 - 8 parallel environments is optimal for single GPU (more adds overhead)
+- Entropy coefficient: 0.025 (encourages exploration)

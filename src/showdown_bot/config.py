@@ -8,11 +8,12 @@ class TrainingConfig(BaseSettings):
     """Training hyperparameters."""
 
     # PPO hyperparameters
-    learning_rate: float = Field(default=3e-4, description="Learning rate for optimizer")
+    learning_rate: float = Field(default=3e-4, description="Initial learning rate for optimizer")
+    final_learning_rate: float = Field(default=3e-5, description="Final learning rate (linear decay)")
     gamma: float = Field(default=0.99, description="Discount factor for rewards")
     gae_lambda: float = Field(default=0.95, description="GAE lambda for advantage estimation")
     clip_epsilon: float = Field(default=0.2, description="PPO clipping parameter")
-    entropy_coef: float = Field(default=0.01, description="Entropy bonus coefficient")
+    entropy_coef: float = Field(default=0.025, description="Entropy bonus coefficient (higher = more exploration)")
     value_coef: float = Field(default=0.5, description="Value loss coefficient")
     max_grad_norm: float = Field(default=0.5, description="Max gradient norm for clipping")
 
@@ -38,23 +39,23 @@ class TrainingConfig(BaseSettings):
         default=1000.0, description="Skill level where curriculum starts (early stage)"
     )
     curriculum_skill_max: float = Field(
-        default=5000.0, description="Skill level where curriculum ends (late stage)"
+        default=6000.0, description="Skill level where curriculum ends (late stage)"
     )
     # Early stage ratios (when skill <= curriculum_skill_min)
     curriculum_early_self_play: float = Field(
-        default=0.3, description="Self-play ratio in early training"
+        default=0.2, description="Self-play ratio in early training"
     )
     curriculum_early_max_damage: float = Field(
-        default=0.4, description="MaxDamage ratio in early training"
+        default=0.5, description="MaxDamage ratio in early training"
     )
     # Late stage ratios (when skill >= curriculum_skill_max)
     curriculum_late_self_play: float = Field(
-        default=0.8, description="Self-play ratio in late training"
+        default=0.6, description="Self-play ratio in late training (reduced to avoid echo chamber)"
     )
     curriculum_late_max_damage: float = Field(
-        default=0.15, description="MaxDamage ratio in late training"
+        default=0.4, description="MaxDamage ratio in late training (teaches optimal damage calc)"
     )
-    # Random ratio = 1 - self_play - max_damage
+    # Random ratio = 1 - self_play - max_damage (0% at late stage - random provides no signal)
 
     # Environment
     num_envs: int = Field(default=8, description="Number of parallel environments")

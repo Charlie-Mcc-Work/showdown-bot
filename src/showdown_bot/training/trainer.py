@@ -487,7 +487,7 @@ class Trainer:
             max_pool_size=20,
             self_play_ratio=self.config.self_play_ratio,
             checkpoint_interval=self.config.checkpoint_interval,
-            sampling_strategy="skill_matched",
+            sampling_strategy="diverse",
             device=device,
             # Curriculum settings
             curriculum_enabled=self.config.curriculum_enabled,
@@ -1095,8 +1095,11 @@ class Trainer:
                 last_done = np.zeros((1,), dtype=np.float32)
                 self.buffer.compute_advantages(last_value, last_done)
 
-                # PPO update
+                # PPO update with learning rate scheduling
                 self.model.train()
+                # Update learning rate based on progress through total training
+                progress = self.stats.total_timesteps / target_timesteps
+                current_lr = self.ppo.update_learning_rate(progress)
                 ppo_stats = self.ppo.update(self.buffer, self.config.batch_size)
 
                 # Update stats
@@ -1234,6 +1237,9 @@ class Trainer:
         # General stats
         self.writer.add_scalar("stats/total_episodes", self.stats.total_episodes, step)
         self.writer.add_scalar("stats/total_updates", self.stats.total_updates, step)
+        # Log current learning rate
+        current_lr = self.ppo.optimizer.param_groups[0]["lr"]
+        self.writer.add_scalar("train/learning_rate", current_lr, step)
 
         # Self-play stats
         if self.self_play_manager:
