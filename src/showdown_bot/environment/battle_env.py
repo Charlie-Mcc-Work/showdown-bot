@@ -194,13 +194,12 @@ def calculate_reward(
     if battle.lost:
         return -1.0
 
-    # Calculate current HP fractions
-    our_hp = sum(
-        p.current_hp_fraction for p in battle.team.values() if not p.fainted
-    ) / 6
-    opp_hp = sum(
-        p.current_hp_fraction for p in battle.opponent_team.values() if not p.fainted
-    ) / 6
+    # Calculate current HP fractions (divide by remaining Pokemon, not 6)
+    our_remaining = [p for p in battle.team.values() if not p.fainted]
+    opp_remaining = [p for p in battle.opponent_team.values() if not p.fainted]
+
+    our_hp = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
+    opp_hp = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
 
     reward = 0.0
 

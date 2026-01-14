@@ -59,7 +59,7 @@ class TeamEncoder(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=pokemon_dim,
             nhead=num_heads,
-            dim_feedforward=hidden_dim * 2,
+            dim_feedforward=hidden_dim * 4,  # Standard ratio is 4x
             dropout=0.1,
             batch_first=True,
         )

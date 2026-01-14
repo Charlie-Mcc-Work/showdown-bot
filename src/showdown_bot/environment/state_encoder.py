@@ -73,6 +73,23 @@ SIDE_CONDITIONS = [
 SIDE_CONDITION_TO_IDX = {s: i for i, s in enumerate(SIDE_CONDITIONS)}
 NUM_SIDE_CONDITIONS = len(SIDE_CONDITIONS)
 
+# Volatile status effects (battle-turn-only, not persistent status)
+VOLATILE_STATUSES = [
+    "leechseed",
+    "substitute",
+    "confusion",
+    "curse",
+    "taunt",
+    "encore",
+    "disable",
+    "yawn",
+    "perishsong",
+    "aquaring",
+    "ingrain",
+    "focusenergy",
+]
+NUM_VOLATILE_STATUSES = len(VOLATILE_STATUSES)
+
 # Move categories
 MOVE_CATEGORIES = ["physical", "special", "status"]
 CATEGORY_TO_IDX = {c: i for i, c in enumerate(MOVE_CATEGORIES)}
@@ -127,6 +144,8 @@ class StateEncoder:
         + NUM_TYPES  # Type 2 one-hot
         + NUM_STATUSES + 1  # Status one-hot (+ none)
         + 7  # Stat boosts (atk, def, spa, spd, spe, acc, eva)
+        + 1  # Speed stat (normalized, for turn order prediction)
+        + NUM_VOLATILE_STATUSES  # Volatile status flags
         + 1  # Is active
         + 1  # Is fainted
         + 1  # Is revealed (for opponent)
@@ -149,6 +168,8 @@ class StateEncoder:
         # Opponent modeling
         + 1  # Num opponent Pokemon revealed (0-1 normalized)
         + 1  # Num opponent Pokemon unrevealed (0-1 normalized)
+        # Type effectiveness (for active moves vs opponent active)
+        + 4  # Type effectiveness multiplier for each move slot (normalized 0-1)
     )
 
     NUM_ACTIONS = 9  # 4 moves + 5 switches (in random battles, max 5 switches possible)
@@ -259,6 +280,20 @@ class StateEncoder:
         for stat in boost_order:
             boost = pokemon.boosts.get(stat, 0)
             features.append(boost / 6.0)
+
+        # Speed stat (normalized, for turn order prediction)
+        # Base speed ranges roughly 5-180, so normalize by 200
+        base_speed = pokemon.base_stats.get("spe", 100) if pokemon.base_stats else 100
+        features.append(min(base_speed / 200.0, 1.0))
+
+        # Volatile status flags
+        effects = pokemon.effects if hasattr(pokemon, "effects") else {}
+        for volatile in VOLATILE_STATUSES:
+            # Check if the volatile effect is present
+            has_volatile = any(
+                e.name.lower() == volatile for e in effects
+            ) if effects else False
+            features.append(1.0 if has_volatile else 0.0)
 
         # Is active
         features.append(1.0 if is_active else 0.0)
@@ -412,6 +447,21 @@ class StateEncoder:
         # This signals how much uncertainty remains about opponent's team
         num_unrevealed = max_opponent_pokemon - num_opponent_revealed
         features.append(num_unrevealed / max_opponent_pokemon)
+
+        # Type effectiveness for each move slot against opponent active Pokemon
+        # This helps the network understand which moves are super effective
+        opponent_active = battle.opponent_active_pokemon
+        available_moves = battle.available_moves if battle.available_moves else []
+        for i in range(4):
+            if i < len(available_moves) and opponent_active is not None:
+                move = available_moves[i]
+                # damage_multiplier returns 0.25, 0.5, 1, 2, or 4
+                # Normalize: 0.25->0.0625, 0.5->0.125, 1->0.25, 2->0.5, 4->1.0
+                multiplier = opponent_active.damage_multiplier(move)
+                features.append(multiplier / 4.0)
+            else:
+                # No move in this slot or no opponent active - neutral effectiveness
+                features.append(0.25)  # 1.0 / 4.0 = neutral
 
         return np.array(features, dtype=np.float32)
 
