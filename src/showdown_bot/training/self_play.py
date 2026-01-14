@@ -1,5 +1,6 @@
 """Self-play system for training against historical checkpoints."""
 
+import json
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,13 +62,54 @@ class HistoricalPlayer(Player):
         self.model.eval()
 
     def _load_checkpoint(self, path: Path) -> None:
-        """Load model weights from checkpoint."""
+        """Load model weights from checkpoint, migrating if needed."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=True)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            self.model.load_state_dict(checkpoint["model_state_dict"])
+            state_dict = checkpoint["model_state_dict"]
         else:
-            # Assume it's just the state dict
-            self.model.load_state_dict(checkpoint)
+            state_dict = checkpoint
+
+        # Try direct load first, migrate if dimensions don't match
+        try:
+            self.model.load_state_dict(state_dict)
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                migrated = self._migrate_state_dict(state_dict)
+                self.model.load_state_dict(migrated)
+            else:
+                raise
+
+    def _migrate_state_dict(
+        self, old_state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Migrate old checkpoint state dict to match current model dimensions."""
+        new_state_dict = self.model.state_dict()
+        migrated = {}
+
+        for key, new_tensor in new_state_dict.items():
+            if key not in old_state_dict:
+                migrated[key] = new_tensor
+                continue
+
+            old_tensor = old_state_dict[key]
+
+            if old_tensor.shape == new_tensor.shape:
+                migrated[key] = old_tensor
+            elif len(old_tensor.shape) == 2 and len(new_tensor.shape) == 2:
+                old_out, old_in = old_tensor.shape
+                new_out, new_in = new_tensor.shape
+
+                if old_out == new_out and old_in < new_in:
+                    # Zero-pad new input features
+                    padded = torch.zeros_like(new_tensor)
+                    padded[:, :old_in] = old_tensor
+                    migrated[key] = padded
+                else:
+                    migrated[key] = new_tensor
+            else:
+                migrated[key] = new_tensor
+
+        return migrated
 
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Choose a move using the loaded model."""
@@ -128,15 +170,19 @@ class OpponentPool:
         self.pool_dir.mkdir(parents=True, exist_ok=True)
         self.max_size = max_size
         self.device = device or torch.device("cpu")
+        self.metadata_path = self.pool_dir / "pool_metadata.json"
 
         self.opponents: list[OpponentInfo] = []
         self.state_encoder = StateEncoder(device=self.device)
 
-        # Load existing checkpoints
+        # Load existing checkpoints and their metadata
         self._load_existing_checkpoints()
 
     def _load_existing_checkpoints(self) -> None:
         """Load existing checkpoints from the pool directory."""
+        # Load metadata if it exists
+        metadata = self._load_metadata()
+
         for checkpoint_path in sorted(self.pool_dir.glob("opponent_*.pt")):
             # Extract timestep from filename
             try:
@@ -144,12 +190,55 @@ class OpponentPool:
             except (IndexError, ValueError):
                 timestep = 0
 
+            # Get saved skill rating from metadata, default to 1000
+            filename = checkpoint_path.name
+            saved_info = metadata.get(filename, {})
+            skill_rating = saved_info.get("skill_rating", 1000.0)
+            games_played = saved_info.get("games_played", 0)
+            wins = saved_info.get("wins", 0)
+            losses = saved_info.get("losses", 0)
+
             self.opponents.append(
                 OpponentInfo(
                     checkpoint_path=checkpoint_path,
                     timestep_added=timestep,
+                    skill_rating=skill_rating,
+                    games_played=games_played,
+                    wins=wins,
+                    losses=losses,
                 )
             )
+
+        if metadata and self.opponents:
+            avg_skill = sum(o.skill_rating for o in self.opponents) / len(self.opponents)
+            print(f"Loaded {len(self.opponents)} opponents (avg skill: {avg_skill:.0f})")
+
+    def _load_metadata(self) -> dict[str, Any]:
+        """Load opponent metadata from JSON file."""
+        if not self.metadata_path.exists():
+            return {}
+        try:
+            with open(self.metadata_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def save_metadata(self) -> None:
+        """Save opponent metadata to JSON file."""
+        metadata = {}
+        for opp in self.opponents:
+            metadata[opp.checkpoint_path.name] = {
+                "skill_rating": opp.skill_rating,
+                "games_played": opp.games_played,
+                "wins": opp.wins,
+                "losses": opp.losses,
+                "timestep_added": opp.timestep_added,
+            }
+        try:
+            with open(self.metadata_path, "w") as f:
+                json.dump(metadata, f, indent=2)
+        except OSError:
+            pass  # Non-critical, will rebuild from defaults
 
     def add_opponent(
         self,
@@ -181,6 +270,9 @@ class OpponentPool:
         # Remove oldest if over max size
         if len(self.opponents) > self.max_size:
             self._prune_pool()
+
+        # Save metadata after adding
+        self.save_metadata()
 
         return opponent_info
 
@@ -215,6 +307,9 @@ class OpponentPool:
                 opponent.checkpoint_path.unlink(missing_ok=True)
 
         self.opponents = new_opponents
+
+        # Save metadata after pruning
+        self.save_metadata()
 
     def sample_opponent(
         self,
@@ -317,6 +412,11 @@ class OpponentPool:
             won,
         )
         opponent_info.skill_rating = new_opponent_skill
+
+        # Save metadata periodically (every 10 games)
+        total_games = sum(o.games_played for o in self.opponents)
+        if total_games % 10 == 0:
+            self.save_metadata()
 
         return new_agent_skill, new_opponent_skill
 

@@ -27,6 +27,7 @@ from showdown_bot.environment.battle_env import calculate_reward
 from showdown_bot.environment.state_encoder import StateEncoder
 from showdown_bot.models.network import PolicyValueNetwork
 from showdown_bot.training.buffer import RolloutBuffer
+from showdown_bot.training.inference_server import BatchedInferenceServer
 from showdown_bot.training.ppo import PPO, PPOStats
 from showdown_bot.training.self_play import SelfPlayManager
 
@@ -263,12 +264,14 @@ class TrainablePlayer(Player):
         model: PolicyValueNetwork,
         state_encoder: StateEncoder,
         device: torch.device,
+        inference_server: BatchedInferenceServer | None = None,
         **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.model = model
         self.state_encoder = state_encoder
         self.device = device
+        self.inference_server = inference_server
 
         # Mixed precision inference - disabled for now, overhead exceeds benefit for small models
         self.use_amp = False  # device.type == "cuda"
@@ -289,29 +292,37 @@ class TrainablePlayer(Player):
         # Encode state
         state = self.state_encoder.encode_battle(battle)
 
-        # Add batch dimension and move to device
-        player_pokemon = state.player_pokemon.unsqueeze(0).to(self.device)
-        opponent_pokemon = state.opponent_pokemon.unsqueeze(0).to(self.device)
-        player_active_idx = torch.tensor([state.player_active_idx], device=self.device)
-        opponent_active_idx = torch.tensor([state.opponent_active_idx], device=self.device)
-        field_state = state.field_state.unsqueeze(0).to(self.device)
-        action_mask = state.action_mask.unsqueeze(0).to(self.device)
+        # Use batched inference server if available, otherwise direct model call
+        if self.inference_server is not None:
+            # Submit to inference server for batching with other environments
+            result = self.inference_server.infer(state)
+            action_idx = result.action
+            log_prob_val = result.log_prob
+            value_val = result.value
+        else:
+            # Direct model inference (batch size 1)
+            player_pokemon = state.player_pokemon.unsqueeze(0).to(self.device)
+            opponent_pokemon = state.opponent_pokemon.unsqueeze(0).to(self.device)
+            player_active_idx = torch.tensor([state.player_active_idx], device=self.device)
+            opponent_active_idx = torch.tensor([state.opponent_active_idx], device=self.device)
+            field_state = state.field_state.unsqueeze(0).to(self.device)
+            action_mask = state.action_mask.unsqueeze(0).to(self.device)
 
-        # Get action from model with mixed precision inference
-        # Note: model.eval() is set once per rollout in the training loop, not per action
-        with torch.no_grad(), autocast("cuda", enabled=self.use_amp):
-            action, log_prob, _, value = self.model.get_action_and_value(
-                player_pokemon,
-                opponent_pokemon,
-                player_active_idx,
-                opponent_active_idx,
-                field_state,
-                action_mask,
-            )
+            # Get action from model with mixed precision inference
+            # Note: model.eval() is set once per rollout in the training loop, not per action
+            with torch.no_grad(), autocast("cuda", enabled=self.use_amp):
+                action, log_prob, _, value = self.model.get_action_and_value(
+                    player_pokemon,
+                    opponent_pokemon,
+                    player_active_idx,
+                    opponent_active_idx,
+                    field_state,
+                    action_mask,
+                )
 
-        action_idx = action.item()
-        log_prob_val = log_prob.item()
-        value_val = value.item()
+            action_idx = action.item()
+            log_prob_val = log_prob.item()
+            value_val = value.item()
 
         # Calculate reward
         reward = calculate_reward(
@@ -389,6 +400,9 @@ class TrainablePlayer(Player):
         self.episode_lengths = []
         self._rollout_wins = 0
         self._rollout_battles = 0
+        # Clear completed battles to prevent memory accumulation
+        if hasattr(self, '_battles'):
+            self._battles.clear()
 
     def get_rollout_stats(self) -> dict[str, float]:
         """Get stats for the current rollout."""
@@ -426,12 +440,14 @@ class Trainer:
         config: TrainingConfig | None = None,
         num_envs: int | None = None,
         server_ports: list[int] | None = None,
+        use_batched_inference: bool = False,  # Disabled: adds latency with poke-env's async model
     ):
         self.model = model
         self.device = device
         self.save_dir = Path(save_dir)
         self.log_dir = Path(log_dir)
         self.use_self_play = use_self_play
+        self.use_batched_inference = use_batched_inference
         self.config = config or training_config  # Use provided config or default
         self.num_envs = num_envs or self.config.num_envs
 
@@ -483,6 +499,17 @@ class Trainer:
             curriculum_late_max_damage=self.config.curriculum_late_max_damage,
         ) if use_self_play else None
 
+        # Batched inference server for efficient GPU utilization
+        # Batches requests from multiple parallel environments together
+        self.inference_server: BatchedInferenceServer | None = None
+        if use_batched_inference and self.num_envs > 1:
+            self.inference_server = BatchedInferenceServer(
+                model=model,
+                device=device,
+                max_batch_size=self.num_envs,
+                max_wait_ms=5.0,  # Wait up to 5ms to collect batch
+            )
+
         # TensorBoard writer - will be set on train start
         self.writer: SummaryWriter | None = None
         self._run_name: str | None = None
@@ -520,6 +547,7 @@ class Trainer:
                     model=self.model,
                     state_encoder=self.state_encoder,
                     device=self.device,
+                    inference_server=self.inference_server,
                     battle_format=self.config.battle_format,
                     max_concurrent_battles=1,
                     server_configuration=server_config,
@@ -540,12 +568,19 @@ class Trainer:
             # Free model memory for HistoricalPlayer opponents
             if hasattr(opponent, 'model') and opponent.model is not None:
                 try:
-                    opponent.model.cpu()
+                    # Move to CPU, delete, and clear references
+                    model = opponent.model
                     opponent.model = None
+                    model.cpu()
+                    del model
                 except Exception:
                     pass
             if hasattr(opponent, 'state_encoder'):
                 opponent.state_encoder = None
+
+            # Clear any battle-related caches
+            if hasattr(opponent, '_battles'):
+                opponent._battles.clear()
         except Exception:
             pass  # Ignore cleanup errors
 
@@ -577,12 +612,17 @@ class Trainer:
             for player in players:
                 if hasattr(player, 'model') and player.model is not None:
                     try:
-                        player.model.cpu()
+                        model = player.model
                         player.model = None
+                        model.cpu()
+                        del model
                     except Exception:
                         pass
                 if hasattr(player, 'state_encoder'):
                     player.state_encoder = None
+                # Clear battle caches
+                if hasattr(player, '_battles'):
+                    player._battles.clear()
 
     def _setup_signal_handlers(self) -> None:
         """Setup handlers for graceful shutdown."""
@@ -946,8 +986,13 @@ class Trainer:
         print(f"Target: {target_timesteps:,}")
         print(f"Parallel environments: {self.num_envs}")
         print(f"Self-play: {'Enabled' if self.use_self_play else 'Disabled'}")
+        print(f"Batched inference: {'Enabled' if self.inference_server else 'Disabled'}")
         print("=" * 60)
         print()
+
+        # Start inference server if enabled
+        if self.inference_server:
+            self.inference_server.start()
 
         # Create multiple players for parallel environments
         players = self._create_players()
@@ -1102,12 +1147,17 @@ class Trainer:
                         self._save_checkpoint("best_model.pt")
                         display.message(f"NEW BEST MODEL! Skill: {old_best:.0f} -> {current_skill:.0f}")
 
+                # Clean up experience data to prevent memory accumulation
+                del all_env_experiences
+                del opponent_infos
+                del opponents
+
                 # Opponents are now cleaned up individually in collect_rollout_single
-                # after each battle finishes naturally. Just do periodic GC.
-                if self.stats.total_updates % 10 == 0:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                # after each battle finishes naturally. Run GC every iteration to
+                # prevent memory accumulation from orphaned objects.
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         except asyncio.CancelledError:
             # Task was cancelled during shutdown - this is expected
@@ -1120,6 +1170,10 @@ class Trainer:
             self._save_checkpoint("emergency_checkpoint.pt")
             raise
         finally:
+            # Stop inference server
+            if self.inference_server:
+                self.inference_server.stop()
+
             # Clean up player connections (full cleanup since we're shutting down)
             try:
                 await self._cleanup_players(players, full_cleanup=True)
@@ -1149,6 +1203,9 @@ class Trainer:
         print(f"Best win rate: {self.stats.best_win_rate:.1%}")
         if self.self_play_manager:
             print(f"Final Skill: {self.self_play_manager.agent_skill:.0f}")
+        if self.inference_server:
+            inf_stats = self.inference_server.get_stats()
+            print(f"Avg batch size: {inf_stats['avg_batch_size']:.1f}")
         print(f"Checkpoint saved: {self.save_dir / 'latest.pt'}")
         print("=" * 60)
 
@@ -1186,6 +1243,12 @@ class Trainer:
             self.writer.add_scalar("self_play/pool_avg_skill", sp_stats["pool_avg_skill"], step)
             self.writer.add_scalar("self_play/games_vs_self_play", sp_stats["games_vs_self_play"], step)
             self.writer.add_scalar("self_play/games_vs_random", sp_stats["games_vs_random"], step)
+
+        # Inference server stats
+        if self.inference_server:
+            inf_stats = self.inference_server.get_stats()
+            self.writer.add_scalar("inference/avg_batch_size", inf_stats["avg_batch_size"], step)
+            self.writer.add_scalar("inference/total_batches", inf_stats["total_batches"], step)
 
     def _load_existing_best_skill(self) -> float:
         """Load the skill rating from existing best_model.pt if it exists.
@@ -1267,11 +1330,100 @@ class Trainer:
             latest_path = self.save_dir / "latest.pt"
             torch.save(checkpoint, latest_path)
 
+    def _migrate_state_dict(
+        self, old_state_dict: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """Migrate an old checkpoint's state dict to match current model dimensions.
+
+        Handles dimension changes from feature updates (like opponent modeling).
+        New input features are zero-initialized, preserving learned weights.
+
+        Args:
+            old_state_dict: State dict from old checkpoint
+
+        Returns:
+            Migrated state dict compatible with current model
+        """
+        new_state_dict = self.model.state_dict()
+        migrated = {}
+        migrations_performed = []
+
+        for key, new_tensor in new_state_dict.items():
+            if key not in old_state_dict:
+                # New parameter, use initialized value
+                migrated[key] = new_tensor
+                migrations_performed.append(f"  Added new param: {key}")
+                continue
+
+            old_tensor = old_state_dict[key]
+
+            if old_tensor.shape == new_tensor.shape:
+                # Same shape, copy directly
+                migrated[key] = old_tensor
+            elif len(old_tensor.shape) == 2 and len(new_tensor.shape) == 2:
+                # Linear layer weight: [out_features, in_features]
+                # Handle input dimension changes (new features added)
+                old_out, old_in = old_tensor.shape
+                new_out, new_in = new_tensor.shape
+
+                if old_out == new_out and old_in < new_in:
+                    # Input features expanded - zero-pad new features
+                    padded = torch.zeros_like(new_tensor)
+                    padded[:, :old_in] = old_tensor
+                    migrated[key] = padded
+                    migrations_performed.append(
+                        f"  Expanded {key}: {old_tensor.shape} -> {new_tensor.shape}"
+                    )
+                else:
+                    # Incompatible change, use new initialization
+                    migrated[key] = new_tensor
+                    migrations_performed.append(
+                        f"  Reset {key}: {old_tensor.shape} -> {new_tensor.shape} (incompatible)"
+                    )
+            else:
+                # Other shape mismatch, use new initialization
+                migrated[key] = new_tensor
+                migrations_performed.append(
+                    f"  Reset {key}: {old_tensor.shape} -> {new_tensor.shape} (incompatible)"
+                )
+
+        if migrations_performed:
+            print("Migrating checkpoint to new model architecture:")
+            for msg in migrations_performed:
+                print(msg)
+
+        return migrated
+
     def load_checkpoint(self, path: str) -> None:
         """Load a training checkpoint."""
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.ppo.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+
+        # Try direct load first, migrate if dimensions don't match
+        model_migrated = False
+        try:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                print(f"Checkpoint has different dimensions, attempting migration...")
+                migrated_state_dict = self._migrate_state_dict(checkpoint["model_state_dict"])
+                self.model.load_state_dict(migrated_state_dict)
+                model_migrated = True
+            else:
+                raise
+
+        # Don't load optimizer state if model was migrated - dimensions won't match
+        # Adam's momentum buffers would have old dimensions and cause errors
+        if model_migrated:
+            print("  Model migrated, using fresh optimizer (old state incompatible)")
+        else:
+            optimizer_state = checkpoint.get("optimizer_state_dict", {})
+            if optimizer_state and "param_groups" in optimizer_state:
+                try:
+                    self.ppo.optimizer.load_state_dict(optimizer_state)
+                except (ValueError, RuntimeError, KeyError):
+                    print("  Optimizer state incompatible, using fresh optimizer")
+            else:
+                print("  No valid optimizer state found, using fresh optimizer")
 
         stats = checkpoint.get("stats", {})
         self.stats.total_timesteps = stats.get("total_timesteps", 0)

@@ -372,6 +372,7 @@ class MultiProcessTrainer:
                     control_queue,
                     str(self.device),
                 ),
+                daemon=True,  # Ensures workers die when main process exits
             )
             worker.start()
 

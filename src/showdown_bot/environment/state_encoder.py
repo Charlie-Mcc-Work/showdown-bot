@@ -111,6 +111,15 @@ class EncodedState:
 class StateEncoder:
     """Encodes Pokemon Showdown battle state into tensors for the neural network."""
 
+    # Move features per slot
+    MOVE_FEATURES = (
+        NUM_TYPES  # Type one-hot
+        + 3  # Category one-hot (physical, special, status)
+        + 1  # Power normalized
+        + 1  # PP fraction
+        + 1  # Is revealed (for opponent modeling)
+    )
+
     # Feature dimensions
     POKEMON_FEATURES = (
         1  # HP fraction
@@ -121,7 +130,13 @@ class StateEncoder:
         + 1  # Is active
         + 1  # Is fainted
         + 1  # Is revealed (for opponent)
-        + 4 * (NUM_TYPES + 3 + 1 + 1)  # 4 moves: type, category, power norm, pp fraction
+        # Opponent modeling features
+        + 1  # Num moves revealed (0-1 normalized)
+        + 1  # Could have more moves (1 if <4 revealed)
+        + 1  # Ability revealed
+        + 1  # Item revealed
+        + 1  # Item consumed/knocked off
+        + 4 * MOVE_FEATURES  # 4 moves with reveal flag
     )
 
     FIELD_FEATURES = (
@@ -131,6 +146,9 @@ class StateEncoder:
         + NUM_SIDE_CONDITIONS  # Opponent side conditions
         + 1  # Trick room active
         + 1  # Turn count (normalized)
+        # Opponent modeling
+        + 1  # Num opponent Pokemon revealed (0-1 normalized)
+        + 1  # Num opponent Pokemon unrevealed (0-1 normalized)
     )
 
     NUM_ACTIONS = 9  # 4 moves + 5 switches (in random battles, max 5 switches possible)
@@ -197,7 +215,13 @@ class StateEncoder:
         is_active: bool,
         is_revealed: bool,
     ) -> "NDArray[np.float32]":
-        """Encode a single Pokemon's state."""
+        """Encode a single Pokemon's state.
+
+        For opponent Pokemon, we track what information has been revealed to us:
+        - Which moves have been used/revealed
+        - Whether ability/item have been revealed
+        - How many unknowns remain
+        """
         features: list[float] = []
 
         # HP fraction (0-1)
@@ -245,19 +269,49 @@ class StateEncoder:
         # Is revealed (for opponent pokemon)
         features.append(1.0 if is_revealed else 0.0)
 
-        # Encode moves (4 slots)
+        # Opponent modeling features
         moves = list(pokemon.moves.values())[:4]
+        num_moves_revealed = len(moves)
+
+        # Num moves revealed (normalized 0-1, max 4 moves)
+        features.append(num_moves_revealed / 4.0)
+
+        # Could have more moves (1 if <4 revealed, signals uncertainty)
+        features.append(1.0 if num_moves_revealed < 4 else 0.0)
+
+        # Ability revealed (poke-env sets ability when it's been revealed in battle)
+        ability_revealed = pokemon.ability is not None
+        features.append(1.0 if ability_revealed else 0.0)
+
+        # Item revealed (poke-env sets item when it's been revealed)
+        item_revealed = pokemon.item is not None and pokemon.item != ""
+        features.append(1.0 if item_revealed else 0.0)
+
+        # Item consumed/knocked off (item was revealed but is now gone)
+        # poke-env uses empty string for consumed/knocked off items
+        item_consumed = pokemon.item == ""
+        features.append(1.0 if item_consumed else 0.0)
+
+        # Encode moves (4 slots) with reveal flags
+        # For our own Pokemon, all moves are revealed (is_revealed=True)
+        # For opponent Pokemon, moves in pokemon.moves have been revealed
         for i in range(4):
             if i < len(moves):
-                features.extend(self._encode_move(moves[i]))
+                # Move is revealed (it's in the moves dict because we've seen it)
+                features.extend(self._encode_move(moves[i], is_revealed=True))
             else:
-                # Empty move slot
-                features.extend([0.0] * (NUM_TYPES + 3 + 1 + 1))
+                # Empty/unknown move slot - all zeros including is_revealed=0
+                features.extend([0.0] * self.MOVE_FEATURES)
 
         return np.array(features, dtype=np.float32)
 
-    def _encode_move(self, move: Move) -> list[float]:
-        """Encode a single move."""
+    def _encode_move(self, move: Move, is_revealed: bool = True) -> list[float]:
+        """Encode a single move.
+
+        Args:
+            move: The move to encode
+            is_revealed: Whether this move has been revealed to us (for opponent modeling)
+        """
         features: list[float] = []
 
         # Type one-hot
@@ -286,6 +340,9 @@ class StateEncoder:
         else:
             pp_fraction = 1.0
         features.append(pp_fraction)
+
+        # Is revealed flag (for opponent modeling)
+        features.append(1.0 if is_revealed else 0.0)
 
         return features
 
@@ -342,6 +399,19 @@ class StateEncoder:
         # Turn count (normalized, assume max 100 turns)
         turn_normalized = min(battle.turn / 100.0, 1.0)
         features.append(turn_normalized)
+
+        # Opponent modeling - how many opponent Pokemon have we seen?
+        num_opponent_revealed = len(battle.opponent_team)
+        # In random battles, opponent has 6 Pokemon
+        max_opponent_pokemon = 6
+
+        # Num opponent Pokemon revealed (normalized 0-1)
+        features.append(num_opponent_revealed / max_opponent_pokemon)
+
+        # Num opponent Pokemon unrevealed (normalized 0-1)
+        # This signals how much uncertainty remains about opponent's team
+        num_unrevealed = max_opponent_pokemon - num_opponent_revealed
+        features.append(num_unrevealed / max_opponent_pokemon)
 
         return np.array(features, dtype=np.float32)
 

@@ -342,7 +342,10 @@ class TestSelfPlayManager:
 
     def test_empty_pool_no_self_play(self, manager):
         """Test no self-play when pool is empty."""
-        assert not manager.should_use_self_play()
+        # With an empty pool, select_opponent_type should never return "self_play"
+        for _ in range(10):
+            opponent_type = manager.select_opponent_type()
+            assert opponent_type != "self_play"
 
     def test_should_add_checkpoint(self, manager):
         """Test checkpoint timing logic."""
@@ -625,3 +628,120 @@ class TestEndToEndPipeline:
             model.named_parameters(), new_model.named_parameters()
         ):
             assert torch.allclose(p1, p2), f"Parameter {n1} mismatch"
+
+    def test_checkpoint_migration_with_dimension_change(self, tmp_path):
+        """Test that checkpoints with old dimensions are migrated correctly."""
+        from showdown_bot.training.trainer import Trainer
+
+        # Create a model with smaller input dimensions (simulating old checkpoint)
+        old_model = PolicyValueNetwork(
+            hidden_dim=64,
+            pokemon_dim=32,
+            num_heads=2,
+            num_layers=1,
+            num_actions=9,
+        )
+
+        # Save checkpoint
+        checkpoint_path = tmp_path / "old_checkpoint.pt"
+        torch.save({
+            "model_state_dict": old_model.state_dict(),
+            "optimizer_state_dict": {},  # Empty optimizer state
+            "stats": {"total_timesteps": 1000},
+        }, checkpoint_path)
+
+        # Create a new model with same dimensions (in real scenario would be different)
+        new_model = PolicyValueNetwork(
+            hidden_dim=64,
+            pokemon_dim=32,
+            num_heads=2,
+            num_layers=1,
+            num_actions=9,
+        )
+
+        # Create trainer and load checkpoint
+        trainer = Trainer(
+            model=new_model,
+            device=torch.device("cpu"),
+            save_dir=str(tmp_path / "checkpoints"),
+            log_dir=str(tmp_path / "logs"),
+            use_self_play=False,
+            use_batched_inference=False,
+        )
+
+        # Should load successfully (same dimensions = no migration needed)
+        trainer.load_checkpoint(str(checkpoint_path))
+        assert trainer.stats.total_timesteps == 1000
+
+    def test_checkpoint_migration_expands_input_features(self, tmp_path):
+        """Test migration when input features are expanded (new features added)."""
+        from showdown_bot.training.trainer import Trainer
+
+        # Create new model
+        new_model = PolicyValueNetwork(
+            hidden_dim=64,
+            pokemon_dim=32,
+            num_heads=2,
+            num_layers=1,
+            num_actions=9,
+        )
+
+        # Manually create an "old" state dict with smaller input dimensions
+        old_state_dict = {}
+        for name, param in new_model.state_dict().items():
+            if name == "player_encoder.pokemon_encoder.mlp.0.weight":
+                # Simulate old checkpoint with fewer input features
+                old_dim = param.shape[1] - 5  # 5 fewer input features
+                old_state_dict[name] = torch.randn(param.shape[0], old_dim)
+            elif name == "opponent_encoder.pokemon_encoder.mlp.0.weight":
+                old_dim = param.shape[1] - 5
+                old_state_dict[name] = torch.randn(param.shape[0], old_dim)
+            elif name == "field_encoder.0.weight":
+                old_dim = param.shape[1] - 2  # 2 fewer field features
+                old_state_dict[name] = torch.randn(param.shape[0], old_dim)
+            else:
+                old_state_dict[name] = param.clone()
+
+        # Save old checkpoint
+        checkpoint_path = tmp_path / "old_checkpoint.pt"
+        torch.save({
+            "model_state_dict": old_state_dict,
+            "optimizer_state_dict": {},
+            "stats": {"total_timesteps": 5000},
+        }, checkpoint_path)
+
+        # Create trainer
+        trainer = Trainer(
+            model=new_model,
+            device=torch.device("cpu"),
+            save_dir=str(tmp_path / "checkpoints"),
+            log_dir=str(tmp_path / "logs"),
+            use_self_play=False,
+            use_batched_inference=False,
+        )
+
+        # Load should succeed via migration
+        trainer.load_checkpoint(str(checkpoint_path))
+
+        # Verify stats were loaded
+        assert trainer.stats.total_timesteps == 5000
+
+        # Verify model can still forward pass
+        batch_size = 2
+        player_pokemon = torch.randn(batch_size, 6, StateEncoder.POKEMON_FEATURES)
+        opponent_pokemon = torch.randn(batch_size, 6, StateEncoder.POKEMON_FEATURES)
+        player_active_idx = torch.zeros(batch_size, dtype=torch.long)
+        opponent_active_idx = torch.zeros(batch_size, dtype=torch.long)
+        field_state = torch.randn(batch_size, StateEncoder.FIELD_FEATURES)
+        action_mask = torch.ones(batch_size, 9)
+
+        new_model.eval()
+        with torch.no_grad():
+            logits, value = new_model(
+                player_pokemon, opponent_pokemon,
+                player_active_idx, opponent_active_idx,
+                field_state, action_mask
+            )
+
+        assert logits.shape == (batch_size, 9)
+        assert value.shape == (batch_size, 1)

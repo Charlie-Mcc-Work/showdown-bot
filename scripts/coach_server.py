@@ -206,19 +206,46 @@ class BrowserStateEncoder:
         # Is revealed
         features.append(1.0 if is_revealed else 0.0)
 
-        # Encode moves (4 slots)
+        # Opponent modeling features
         moves = pokemon.get("moves", [])
+        num_moves_revealed = len(moves)
+
+        # Num moves revealed (normalized 0-1, max 4 moves)
+        features.append(num_moves_revealed / 4.0)
+
+        # Could have more moves (1 if <4 revealed)
+        features.append(1.0 if num_moves_revealed < 4 else 0.0)
+
+        # Ability revealed (browser may not track this)
+        ability_revealed = pokemon.get("ability") is not None
+        features.append(1.0 if ability_revealed else 0.0)
+
+        # Item revealed
+        item = pokemon.get("item")
+        item_revealed = item is not None and item != ""
+        features.append(1.0 if item_revealed else 0.0)
+
+        # Item consumed/knocked off
+        item_consumed = item == ""
+        features.append(1.0 if item_consumed else 0.0)
+
+        # Encode moves (4 slots) with is_revealed flag
         for i in range(4):
             if i < len(moves):
-                features.extend(self._encode_move(moves[i]))
+                features.extend(self._encode_move(moves[i], is_revealed=True))
             else:
-                # Empty move slot
-                features.extend([0.0] * (NUM_TYPES + 3 + 1 + 1))
+                # Empty move slot - all zeros including is_revealed=0
+                features.extend([0.0] * StateEncoder.MOVE_FEATURES)
 
         return np.array(features, dtype=np.float32)
 
-    def _encode_move(self, move: str | dict) -> list[float]:
-        """Encode a single move (simplified - uses name heuristics)."""
+    def _encode_move(self, move: str | dict, is_revealed: bool = True) -> list[float]:
+        """Encode a single move (simplified - uses name heuristics).
+
+        Args:
+            move: Move data (string name or dict with details)
+            is_revealed: Whether this move has been revealed to us
+        """
         features: list[float] = []
 
         # Type one-hot - we'd need a move database for accuracy
@@ -242,6 +269,9 @@ class BrowserStateEncoder:
         else:
             pp_fraction = 1.0
         features.append(pp_fraction)
+
+        # Is revealed flag (for opponent modeling)
+        features.append(1.0 if is_revealed else 0.0)
 
         return features
 
@@ -285,6 +315,18 @@ class BrowserStateEncoder:
         # Turn count normalized
         turn = state.get("turn", 1)
         features.append(min(turn / 100.0, 1.0))
+
+        # Opponent modeling - how many opponent Pokemon have we seen?
+        opponent_team = state.get("opponentTeam", [])
+        num_opponent_revealed = len(opponent_team)
+        max_opponent_pokemon = 6
+
+        # Num opponent Pokemon revealed (normalized 0-1)
+        features.append(num_opponent_revealed / max_opponent_pokemon)
+
+        # Num opponent Pokemon unrevealed (normalized 0-1)
+        num_unrevealed = max_opponent_pokemon - num_opponent_revealed
+        features.append(num_unrevealed / max_opponent_pokemon)
 
         return np.array(features, dtype=np.float32)
 

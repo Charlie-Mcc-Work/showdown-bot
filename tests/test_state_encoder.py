@@ -57,7 +57,8 @@ class TestStateEncoderDimensions:
     def test_pokemon_features_dimension(self):
         """Verify Pokemon feature dimension calculation."""
         encoder = StateEncoder()
-        # HP + Type1 + Type2 + Status + Boosts + IsActive + IsFainted + IsRevealed + 4*MoveFeatures
+        # HP + Type1 + Type2 + Status + Boosts + IsActive + IsFainted + IsRevealed
+        # + OpponentModelingFeatures + 4*MoveFeatures
         expected = (
             1  # HP
             + NUM_TYPES  # Type 1
@@ -67,13 +68,19 @@ class TestStateEncoderDimensions:
             + 1  # Is active
             + 1  # Is fainted
             + 1  # Is revealed
-            + 4 * (NUM_TYPES + 3 + 1 + 1)  # 4 moves
+            # Opponent modeling features
+            + 1  # Num moves revealed
+            + 1  # Could have more moves
+            + 1  # Ability revealed
+            + 1  # Item revealed
+            + 1  # Item consumed
+            + 4 * (NUM_TYPES + 3 + 1 + 1 + 1)  # 4 moves with is_revealed flag
         )
         assert StateEncoder.POKEMON_FEATURES == expected
 
     def test_field_features_dimension(self):
         """Verify field feature dimension calculation."""
-        # Weather + Terrain + Player hazards + Opponent hazards + Trick room + Turn
+        # Weather + Terrain + Player hazards + Opponent hazards + Trick room + Turn + OpponentReveal
         expected = (
             len(WEATHER_TO_IDX) + 1  # Weather + none
             + len(TERRAIN_TO_IDX) + 1  # Terrain + none
@@ -81,6 +88,9 @@ class TestStateEncoderDimensions:
             + len(SIDE_CONDITION_TO_IDX)  # Opponent side
             + 1  # Trick room
             + 1  # Turn
+            # Opponent modeling
+            + 1  # Num opponent Pokemon revealed
+            + 1  # Num opponent Pokemon unrevealed
         )
         assert StateEncoder.FIELD_FEATURES == expected
 
@@ -276,8 +286,17 @@ class TestMoveEncoding:
     def test_encode_move_feature_length(self, encoder, mock_move):
         """Test move feature length."""
         features = encoder._encode_move(mock_move)
-        expected_length = NUM_TYPES + 3 + 1 + 1  # type + category + power + pp
+        expected_length = NUM_TYPES + 3 + 1 + 1 + 1  # type + category + power + pp + is_revealed
         assert len(features) == expected_length
+
+    def test_encode_move_is_revealed_flag(self, encoder, mock_move):
+        """Test is_revealed flag in move encoding."""
+        features_revealed = encoder._encode_move(mock_move, is_revealed=True)
+        features_hidden = encoder._encode_move(mock_move, is_revealed=False)
+
+        is_revealed_idx = NUM_TYPES + 3 + 1 + 1  # Last feature
+        assert features_revealed[is_revealed_idx] == 1.0
+        assert features_hidden[is_revealed_idx] == 0.0
 
 
 class TestFieldEncoding:
@@ -305,19 +324,33 @@ class TestFieldEncoding:
     def test_encode_field_turn_normalization(self, encoder, mock_battle):
         """Test turn count normalization."""
         mock_battle.turn = 50
+        mock_battle.opponent_team = {}  # Empty opponent team
 
         encoded = encoder._encode_field(mock_battle)
 
-        # Turn is last feature
-        assert encoded[-1] == pytest.approx(0.5)
+        # Turn is at index: weather(6) + terrain(5) + player_side(8) + opp_side(8) + trick_room(1) = 28
+        turn_idx = 6 + 5 + 8 + 8 + 1
+        assert encoded[turn_idx] == pytest.approx(0.5)
 
     def test_encode_field_turn_capped(self, encoder, mock_battle):
         """Test turn count is capped at 1.0."""
         mock_battle.turn = 150
+        mock_battle.opponent_team = {}  # Empty opponent team
 
         encoded = encoder._encode_field(mock_battle)
 
-        assert encoded[-1] == pytest.approx(1.0)
+        turn_idx = 6 + 5 + 8 + 8 + 1
+        assert encoded[turn_idx] == pytest.approx(1.0)
+
+    def test_encode_field_opponent_reveal_count(self, encoder, mock_battle):
+        """Test opponent reveal count encoding."""
+        mock_battle.opponent_team = {f"p{i}": MagicMock() for i in range(3)}  # 3 revealed
+
+        encoded = encoder._encode_field(mock_battle)
+
+        # Opponent reveal features are last two
+        assert encoded[-2] == pytest.approx(3 / 6)  # 3 revealed / 6 max
+        assert encoded[-1] == pytest.approx(3 / 6)  # 3 unrevealed / 6 max
 
 
 class TestActionMask:
