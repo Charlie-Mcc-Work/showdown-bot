@@ -230,7 +230,7 @@ class TrainingDisplay:
             bench_str = "Bench: --"
 
         # Build the status line
-        # Format: [progress bar] 7.5M/12M (62%) | 1234/s | Win:85% | Bench:70% | Skill:1234 | ETA:2h15m
+        # Format: [progress bar] 7.5M/12M (62%) | 1234/s | Win:85% | Bench:70% | ETA:2h15m
         bar_width = 20
         filled = int(bar_width * progress)
         bar = "=" * filled + "-" * (bar_width - filled)
@@ -300,8 +300,6 @@ class TrainablePlayer(Player):
         """Choose a move and store the experience."""
         # Encode state
         state = self.state_encoder.encode_battle(battle)
-
-        # Use batched inference server if available, otherwise direct model call
         if self.inference_server is not None:
             # Submit to inference server for batching with other environments
             result = self.inference_server.infer(state)
@@ -513,10 +511,10 @@ class Trainer:
             checkpoint_interval=self.config.checkpoint_interval,
             sampling_strategy="diverse",
             device=device,
-            # Curriculum settings
+            # Curriculum settings (based on Bench% - win rate vs MaxDamage)
             curriculum_enabled=self.config.curriculum_enabled,
-            curriculum_skill_min=self.config.curriculum_skill_min,
-            curriculum_skill_max=self.config.curriculum_skill_max,
+            curriculum_bench_min=self.config.curriculum_bench_min,
+            curriculum_bench_max=self.config.curriculum_bench_max,
             curriculum_early_self_play=self.config.curriculum_early_self_play,
             curriculum_early_max_damage=self.config.curriculum_early_max_damage,
             curriculum_late_self_play=self.config.curriculum_late_self_play,
@@ -1079,9 +1077,11 @@ class Trainer:
 
                 # Collect rollouts in parallel with automatic retry on connection errors
                 # Pass total steps - fast envs contribute more while slow ones are still battling
+                t_rollout_start = time.perf_counter()
                 all_env_experiences, players, opponents = await self.collect_rollout_with_retry(
                     players, opponents, self.config.rollout_steps
                 )
+                t_rollout = time.perf_counter() - t_rollout_start
 
                 # Aggregate rollout stats from all players
                 total_wins = sum(p._rollout_wins for p in players)
@@ -1126,7 +1126,9 @@ class Trainer:
                 # Update learning rate based on progress through total training
                 progress = self.stats.total_timesteps / target_timesteps
                 current_lr = self.ppo.update_learning_rate(progress)
+                t_ppo_start = time.perf_counter()
                 ppo_stats = self.ppo.update(self.buffer, self.config.batch_size)
+                t_ppo = time.perf_counter() - t_ppo_start
 
                 # Update stats
                 self.stats.total_timesteps += total_added

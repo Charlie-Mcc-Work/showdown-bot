@@ -537,10 +537,10 @@ class SelfPlayManager:
         checkpoint_interval: int = 50000,
         sampling_strategy: str = "diverse",
         device: torch.device | None = None,
-        # Curriculum parameters
+        # Curriculum parameters (based on Bench% - win rate vs MaxDamage)
         curriculum_enabled: bool = True,
-        curriculum_skill_min: float = 1000.0,
-        curriculum_skill_max: float = 6000.0,
+        curriculum_bench_min: float = 0.30,
+        curriculum_bench_max: float = 0.70,
         curriculum_early_self_play: float = 0.3,
         curriculum_early_max_damage: float = 0.7,
         curriculum_late_self_play: float = 0.95,
@@ -556,8 +556,8 @@ class SelfPlayManager:
             sampling_strategy: How to sample opponents
             device: Device for models
             curriculum_enabled: Whether to use curriculum-based opponent selection
-            curriculum_skill_min: Skill level at start of curriculum
-            curriculum_skill_max: Skill level at end of curriculum
+            curriculum_bench_min: Bench% (win rate vs MaxDamage) at start of curriculum
+            curriculum_bench_max: Bench% (win rate vs MaxDamage) at end of curriculum
             curriculum_early_self_play: Self-play ratio at early stage
             curriculum_early_max_damage: MaxDamage ratio at early stage
             curriculum_late_self_play: Self-play ratio at late stage
@@ -569,10 +569,10 @@ class SelfPlayManager:
         self.sampling_strategy = sampling_strategy
         self.device = device or torch.device("cpu")
 
-        # Curriculum settings
+        # Curriculum settings (based on Bench% - win rate vs MaxDamage)
         self.curriculum_enabled = curriculum_enabled
-        self.curriculum_skill_min = curriculum_skill_min
-        self.curriculum_skill_max = curriculum_skill_max
+        self.curriculum_bench_min = curriculum_bench_min
+        self.curriculum_bench_max = curriculum_bench_max
         self.curriculum_early_self_play = curriculum_early_self_play
         self.curriculum_early_max_damage = curriculum_early_max_damage
         self.curriculum_late_self_play = curriculum_late_self_play
@@ -599,7 +599,7 @@ class SelfPlayManager:
         self._results_random: deque[bool] = deque(maxlen=self._rolling_window)
 
     def get_curriculum_ratios(self) -> tuple[float, float, float]:
-        """Get current opponent ratios based on skill level.
+        """Get current opponent ratios based on Bench% (win rate vs MaxDamage).
 
         Returns:
             Tuple of (self_play_ratio, max_damage_ratio, random_ratio)
@@ -608,12 +608,18 @@ class SelfPlayManager:
             # Use fixed ratio when curriculum is disabled
             return self.self_play_ratio, 0.0, 1.0 - self.self_play_ratio
 
-        # Calculate progress through curriculum (0 to 1)
-        skill_range = self.curriculum_skill_max - self.curriculum_skill_min
-        if skill_range <= 0:
+        # Get current Bench% (rolling win rate vs MaxDamage)
+        bench_rate = self.get_rolling_win_rates()["max_damage"]
+        if bench_rate is None:
+            # No games played yet, use early stage ratios
+            bench_rate = 0.0
+
+        # Calculate progress through curriculum (0 to 1) based on Bench%
+        bench_range = self.curriculum_bench_max - self.curriculum_bench_min
+        if bench_range <= 0:
             progress = 1.0
         else:
-            progress = (self.agent_skill - self.curriculum_skill_min) / skill_range
+            progress = (bench_rate - self.curriculum_bench_min) / bench_range
             progress = max(0.0, min(1.0, progress))  # Clamp to [0, 1]
 
         # Linear interpolation between early and late ratios
@@ -706,13 +712,11 @@ class SelfPlayManager:
                 player = self.opponent_pool.create_player(
                     opponent_info, battle_format, server_configuration
                 )
-                self.games_vs_self_play += 1
                 return player, opponent_info, "self_play"
             # Fallback if sampling failed
             opponent_type = "max_damage"
 
         if opponent_type == "max_damage":
-            self.games_vs_max_damage += 1
             return MaxDamagePlayer(
                 battle_format=battle_format,
                 max_concurrent_battles=1,
@@ -720,7 +724,6 @@ class SelfPlayManager:
             ), None, "max_damage"
 
         # Random
-        self.games_vs_random += 1
         return RandomPlayer(
             battle_format=battle_format,
             max_concurrent_battles=1,
@@ -746,12 +749,15 @@ class SelfPlayManager:
                 opponent_info, won, self.agent_skill
             )
 
-        # Track rolling win rates for all opponent types
+        # Track game counts and rolling win rates for all opponent types
         if opponent_type == "self_play":
+            self.games_vs_self_play += 1
             self._results_self_play.append(won)
         elif opponent_type == "max_damage":
+            self.games_vs_max_damage += 1
             self._results_max_damage.append(won)
         elif opponent_type == "random":
+            self.games_vs_random += 1
             self._results_random.append(won)
 
     def get_rolling_win_rates(self) -> dict[str, float | None]:

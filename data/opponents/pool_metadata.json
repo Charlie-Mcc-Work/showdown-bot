@@ -1,0 +1,142 @@
+{
+  "opponent_1025881.pt": {
+    "skill_rating": 1268.6031837182902,
+    "games_played": 169,
+    "wins": 87,
+    "losses": 82,
+    "timestep_added": 1025881
+  },
+  "opponent_104448.pt": {
+    "skill_rating": 1175.2493053554476,
+    "games_played": 1059,
+    "wins": 441,
+    "losses": 618,
+    "timestep_added": 104448
+  },
+  "opponent_1127437.pt": {
+    "skill_rating": 1233.9020020101584,
+    "games_played": 178,
+    "wins": 88,
+    "losses": 90,
+    "timestep_added": 1127437
+  },
+  "opponent_1178637.pt": {
+    "skill_rating": 1251.3887795762794,
+    "games_played": 80,
+    "wins": 44,
+    "losses": 36,
+    "timestep_added": 1178637
+  },
+  "opponent_1229837.pt": {
+    "skill_rating": 1305.915530572085,
+    "games_played": 42,
+    "wins": 25,
+    "losses": 17,
+    "timestep_added": 1229837
+  },
+  "opponent_2048.pt": {
+    "skill_rating": 935.4305273996072,
+    "games_played": 1453,
+    "wins": 228,
+    "losses": 1225,
+    "timestep_added": 2048
+  },
+  "opponent_258048.pt": {
+    "skill_rating": 1255.3902180284438,
+    "games_played": 689,
+    "wins": 263,
+    "losses": 426,
+    "timestep_added": 258048
+  },
+  "opponent_411648.pt": {
+    "skill_rating": 1286.9636124580215,
+    "games_played": 671,
+    "wins": 257,
+    "losses": 414,
+    "timestep_added": 411648
+  },
+  "opponent_462848.pt": {
+    "skill_rating": 1154.6218989684867,
+    "games_played": 458,
+    "wins": 185,
+    "losses": 273,
+    "timestep_added": 462848
+  },
+  "opponent_514048.pt": {
+    "skill_rating": 1247.099487904276,
+    "games_played": 549,
+    "wins": 244,
+    "losses": 305,
+    "timestep_added": 514048
+  },
+  "opponent_616448.pt": {
+    "skill_rating": 1339.2496550210535,
+    "games_played": 334,
+    "wins": 145,
+    "losses": 189,
+    "timestep_added": 616448
+  },
+  "opponent_667648.pt": {
+    "skill_rating": 1262.306285638955,
+    "games_played": 350,
+    "wins": 162,
+    "losses": 188,
+    "timestep_added": 667648
+  },
+  "opponent_718848.pt": {
+    "skill_rating": 1214.9648496646462,
+    "games_played": 229,
+    "wins": 119,
+    "losses": 110,
+    "timestep_added": 718848
+  },
+  "opponent_770048.pt": {
+    "skill_rating": 1277.48849262072,
+    "games_played": 275,
+    "wins": 113,
+    "losses": 162,
+    "timestep_added": 770048
+  },
+  "opponent_821248.pt": {
+    "skill_rating": 1138.696094570688,
+    "games_played": 258,
+    "wins": 115,
+    "losses": 143,
+    "timestep_added": 821248
+  },
+  "opponent_872448.pt": {
+    "skill_rating": 1271.3422280893926,
+    "games_played": 143,
+    "wins": 72,
+    "losses": 71,
+    "timestep_added": 872448
+  },
+  "opponent_923481.pt": {
+    "skill_rating": 1200.7184355290033,
+    "games_played": 164,
+    "wins": 74,
+    "losses": 90,
+    "timestep_added": 923481
+  },
+  "opponent_974681.pt": {
+    "skill_rating": 1288.8084763512757,
+    "games_played": 111,
+    "wins": 60,
+    "losses": 51,
+    "timestep_added": 974681
+  },
+  "opponent_1281037.pt": {
+    "skill_rating": 1241.6431330098408,
+    "games_played": 43,
+    "wins": 21,
+    "losses": 22,
+    "timestep_added": 1281037
+  },
+  "opponent_1332237.pt": {
+    "skill_rating": 1248.5499082282845,
+    "games_played": 15,
+    "wins": 8,
+    "losses": 7,
+    "timestep_added": 1332237
+  }
+}

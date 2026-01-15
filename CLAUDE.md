@@ -21,8 +21,11 @@ cd ~/pokemon-showdown && npm install
 ### Training Commands
 
 ```bash
-# Random Battles - just run this
+# Random Battles - single-process (default, ~290/s)
 ./scripts/run_training.sh
+
+# Random Battles - multi-process (faster, ~500/s, uses 2 CPU cores)
+./scripts/run_training.sh --multiproc
 
 # OU Joint Training - player + teambuilder together
 ./scripts/run_training_ou.sh
@@ -35,7 +38,7 @@ All scripts automatically:
 - Start Pokemon Showdown servers
 - Resume from checkpoint
 - Save on Ctrl+C
-- Use optimal settings (8 parallel environments)
+- Use optimal settings (1 server, 6 envs per worker)
 
 ### Monitoring
 
@@ -55,7 +58,8 @@ tensorboard --logdir runs/
 
 | Mode | Speed | What's Training |
 |------|-------|-----------------|
-| Random Battles | ~215 it/s | Player network |
+| Random Battles (single-process) | ~290 it/s | Player network |
+| Random Battles (multi-process) | ~500 it/s | Player network (2 CPU cores) |
 | OU Player-only | ~150 it/s | Player network (with OU mechanics) |
 | OU Joint | ~60 it/s | Player + Teambuilder networks together |
 
@@ -82,7 +86,7 @@ python scripts/coach_server.py
 
 | Area | Files |
 |------|-------|
-| Training | `scripts/train.py`, `scripts/train_ou.py` |
+| Training | `scripts/train.py`, `scripts/train_multiproc.py`, `scripts/train_ou.py` |
 | Scripts | `scripts/run_training.sh`, `scripts/run_training_ou.sh` |
 | Monitoring | `scripts/monitor_training.sh` |
 | Network | `src/showdown_bot/models/network.py` |
@@ -105,16 +109,16 @@ python scripts/coach_server.py
 Linear decay from `3e-4` → `3e-5` over training. Prevents late-stage oscillation.
 
 ### Curriculum Opponent Selection
-Opponent mix adjusts based on skill level:
+Opponent mix adjusts based on Bench% (win rate vs MaxDamage):
 
-| Stage | Self-Play | MaxDamage | Random |
-|-------|-----------|-----------|--------|
-| Early (<1000 skill) | 20% | 50% | 30% |
-| Late (>6000 skill) | 60% | 40% | 0% |
+| Stage | Self-Play | MaxDamage |
+|-------|-----------|-----------|
+| Early (Bench <30%) | 30% | 70% |
+| Late (Bench >70%) | 95% | 5% |
 
 - **MaxDamage**: Deterministic optimal-damage player, teaches damage calculations
 - **Self-play**: Historical checkpoints with diverse sampling
-- **Random**: Only useful early for learning basics
+- Model graduates to more self-play only after proving it can beat MaxDamage
 
 ### Diverse Opponent Sampling
 Self-play uses mixed sampling to avoid echo chambers:
@@ -131,5 +135,6 @@ Pool pruning keeps: oldest (weak baseline), newest, best, worst, plus skill-dive
 - Reward: win/loss + HP differential + KO bonus
 - Browser extension uses `world: "MAIN"` to access PS variables
 - Battle request at `app.curRoom.request` (not `.battle.request`)
-- 8 parallel environments is optimal for single GPU (more adds overhead)
+- Optimal config: 1 PS server, 6 envs per process (~290/s single, ~500/s multi)
+- Multi-process training uses 2 workers to bypass Python's GIL
 - Entropy coefficient: 0.025 (encourages exploration)

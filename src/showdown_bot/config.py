@@ -30,25 +30,25 @@ class TrainingConfig(BaseSettings):
         default=0.8, description="Fraction of games against self vs random (used if curriculum disabled)"
     )
 
-    # Curriculum opponent selection - adjusts opponent mix based on skill
+    # Curriculum opponent selection - adjusts opponent mix based on Bench% (win rate vs MaxDamage)
     curriculum_enabled: bool = Field(
         default=True, description="Enable curriculum-based opponent selection"
     )
-    # Skill thresholds for curriculum stages
-    curriculum_skill_min: float = Field(
-        default=1000.0, description="Skill level where curriculum starts (early stage)"
+    # Bench% thresholds for curriculum stages (win rate vs MaxDamage, 0.0 to 1.0)
+    curriculum_bench_min: float = Field(
+        default=0.30, description="Bench% where curriculum starts (early stage)"
     )
-    curriculum_skill_max: float = Field(
-        default=6000.0, description="Skill level where curriculum ends (late stage)"
+    curriculum_bench_max: float = Field(
+        default=0.70, description="Bench% where curriculum ends (late stage)"
     )
-    # Early stage ratios (when skill <= curriculum_skill_min)
+    # Early stage ratios (when Bench% <= curriculum_bench_min)
     curriculum_early_self_play: float = Field(
         default=0.3, description="Self-play ratio in early training"
     )
     curriculum_early_max_damage: float = Field(
         default=0.7, description="MaxDamage ratio in early training (learn fundamentals)"
     )
-    # Late stage ratios (when skill >= curriculum_skill_max)
+    # Late stage ratios (when Bench% >= curriculum_bench_max)
     curriculum_late_self_play: float = Field(
         default=0.95, description="Self-play ratio in late training (AlphaZero-style)"
     )
