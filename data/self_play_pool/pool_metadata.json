@@ -1,9 +1,23 @@
 {
-  "opponent_499.pt": {
+  "opponent_433.pt": {
     "skill_rating": 1000.0,
     "games_played": 0,
     "wins": 0,
     "losses": 0,
-    "timestep_added": 499
+    "timestep_added": 433
+  },
+  "opponent_50685.pt": {
+    "skill_rating": 1000.0,
+    "games_played": 0,
+    "wins": 0,
+    "losses": 0,
+    "timestep_added": 50685
+  },
+  "opponent_100767.pt": {
+    "skill_rating": 1000.0,
+    "games_played": 0,
+    "wins": 0,
+    "losses": 0,
+    "timestep_added": 100767
   }
 }

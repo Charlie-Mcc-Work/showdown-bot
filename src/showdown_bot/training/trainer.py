@@ -339,12 +339,10 @@ class TrainablePlayer(Player):
         )
 
         # Update HP tracking
-        self.prev_hp_fraction = sum(
-            p.current_hp_fraction for p in battle.team.values() if not p.fainted
-        ) / 6
-        self.prev_opp_hp_fraction = sum(
-            p.current_hp_fraction for p in battle.opponent_team.values() if not p.fainted
-        ) / 6
+        our_remaining = [p for p in battle.team.values() if not p.fainted]
+        opp_remaining = [p for p in battle.opponent_team.values() if not p.fainted]
+        self.prev_hp_fraction = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
+        self.prev_opp_hp_fraction = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
 
         # Store experience
         self.current_experiences.append({

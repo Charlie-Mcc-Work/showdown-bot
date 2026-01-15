@@ -125,12 +125,10 @@ def worker_process(
 
             reward = calculate_reward(battle, self.prev_hp_fraction, self.prev_opp_hp_fraction)
 
-            self.prev_hp_fraction = sum(
-                p.current_hp_fraction for p in battle.team.values() if not p.fainted
-            ) / 6
-            self.prev_opp_hp_fraction = sum(
-                p.current_hp_fraction for p in battle.opponent_team.values() if not p.fainted
-            ) / 6
+            our_remaining = [p for p in battle.team.values() if not p.fainted]
+            opp_remaining = [p for p in battle.opponent_team.values() if not p.fainted]
+            self.prev_hp_fraction = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
+            self.prev_opp_hp_fraction = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
 
             self.current_experiences.append({
                 "player_pokemon": state.player_pokemon.numpy(),

@@ -78,12 +78,10 @@ def calculate_ou_reward(
         return -1.0
 
     # Calculate current HP fractions
-    our_hp = sum(
-        p.current_hp_fraction for p in battle.team.values() if not p.fainted
-    ) / 6
-    opp_hp = sum(
-        p.current_hp_fraction for p in battle.opponent_team.values() if not p.fainted
-    ) / 6
+    our_remaining = [p for p in battle.team.values() if not p.fainted]
+    opp_remaining = [p for p in battle.opponent_team.values() if not p.fainted]
+    our_hp = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
+    opp_hp = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
 
     reward = 0.0
 
@@ -183,12 +181,10 @@ class OUTrainablePlayer(Player):
         )
 
         # Update HP tracking
-        self.prev_hp_fraction = sum(
-            p.current_hp_fraction for p in battle.team.values() if not p.fainted
-        ) / 6
-        self.prev_opp_hp_fraction = sum(
-            p.current_hp_fraction for p in battle.opponent_team.values() if not p.fainted
-        ) / 6
+        our_remaining = [p for p in battle.team.values() if not p.fainted]
+        opp_remaining = [p for p in battle.opponent_team.values() if not p.fainted]
+        self.prev_hp_fraction = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
+        self.prev_opp_hp_fraction = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
 
         # Store experience (keep state on CPU for memory efficiency)
         self.current_experiences.append({

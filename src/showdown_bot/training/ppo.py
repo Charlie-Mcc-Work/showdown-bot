@@ -146,7 +146,7 @@ class PPO:
                     )
                     value_loss1 = F.mse_loss(values, batch["returns"])
                     value_loss2 = F.mse_loss(values_clipped, batch["returns"])
-                    value_loss = torch.max(value_loss1, value_loss2)
+                    value_loss = torch.min(value_loss1, value_loss2)
 
                     # Entropy bonus (for exploration)
                     entropy_loss = -entropy.mean()

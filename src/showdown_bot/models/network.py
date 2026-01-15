@@ -189,7 +189,7 @@ class PolicyValueNetwork(nn.Module):
         """Initialize network weights."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
-                nn.init.orthogonal_(module.weight, gain=0.01)
+                nn.init.orthogonal_(module.weight, gain=1.0)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
