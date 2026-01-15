@@ -29,7 +29,7 @@ from showdown_bot.models.network import PolicyValueNetwork
 from showdown_bot.training.buffer import RolloutBuffer
 from showdown_bot.training.inference_server import BatchedInferenceServer
 from showdown_bot.training.ppo import PPO, PPOStats
-from showdown_bot.training.self_play import SelfPlayManager
+from showdown_bot.training.self_play import SelfPlayManager, HistoricalPlayer
 
 
 # Maximum retries for websocket connection errors
@@ -185,11 +185,10 @@ class TrainingDisplay:
         timesteps: int,
         rollout_stats: dict | None = None,
         ppo_stats: "PPOStats | None" = None,
-        skill: float | None = None,
         pool_size: int | None = None,
         memory_str: str = "",
         memory_percent: float = 0.0,
-        best_skill: float = 0.0,
+        benchmark_win_rate: float | None = None,
     ):
         """Update the display in place."""
         now = time.time()
@@ -223,10 +222,15 @@ class TrainingDisplay:
             eta_str = "--"
 
         win_rate = rollout_stats.get("win_rate", 0.0) if rollout_stats else 0.0
-        skill_val = skill if skill is not None else 1000.0
+
+        # Format benchmark (MaxDamage win rate) - this is the key improvement metric
+        if benchmark_win_rate is not None:
+            bench_str = f"Bench:{benchmark_win_rate:>3.0%}"
+        else:
+            bench_str = "Bench: --"
 
         # Build the status line
-        # Format: [progress bar] 7.5M/12M (62%) | 1234/s | Win:85% | Skill:30066 | ETA:2h15m
+        # Format: [progress bar] 7.5M/12M (62%) | 1234/s | Win:85% | Bench:70% | Skill:1234 | ETA:2h15m
         bar_width = 20
         filled = int(bar_width * progress)
         bar = "=" * filled + "-" * (bar_width - filled)
@@ -234,7 +238,7 @@ class TrainingDisplay:
         status_content = (
             f"[{bar}] {self._format_number(timesteps)}/{self._format_number(self.total_timesteps)} "
             f"({progress:>5.1%}) | {speed:>5.0f}/s | Win:{win_rate:>3.0%} | "
-            f"Skill:{skill_val:>5.0f} | Best:{best_skill:>5.0f} | ETA:{eta_str}"
+            f"{bench_str} | ETA:{eta_str}"
         )
 
         if self._is_tty:
@@ -286,6 +290,11 @@ class TrainablePlayer(Player):
         self.episode_lengths: list[int] = []
         self._rollout_wins: int = 0
         self._rollout_battles: int = 0
+
+        # Track individual battle results for rolling win rate tracking
+        # Each entry is (won: bool, opponent_type: str)
+        self._battle_results: list[tuple[bool, str]] = []
+        self._current_opponent_type: str = "self_play"
 
     def choose_move(self, battle: AbstractBattle) -> BattleOrder:
         """Choose a move and store the experience."""
@@ -367,12 +376,18 @@ class TrainablePlayer(Player):
         if battle.won:
             final_reward = 1.0
             self._rollout_wins += 1
+            won = True
         elif battle.lost:
             final_reward = -1.0
+            won = False
         else:
             final_reward = 0.0
+            won = False  # Treat draws as losses for tracking
 
         self._rollout_battles += 1
+
+        # Track individual battle result for rolling win rate
+        self._battle_results.append((won, self._current_opponent_type))
 
         # Update last experience with terminal reward
         if self.current_experiences:
@@ -400,6 +415,7 @@ class TrainablePlayer(Player):
         self.episode_lengths = []
         self._rollout_wins = 0
         self._rollout_battles = 0
+        self._battle_results = []
         # Clear completed battles to prevent memory accumulation
         if hasattr(self, '_battles'):
             self._battles.clear()
@@ -413,6 +429,14 @@ class TrainablePlayer(Player):
             "avg_reward": float(np.mean(self.episode_rewards)) if self.episode_rewards else 0.0,
             "avg_length": float(np.mean(self.episode_lengths)) if self.episode_lengths else 0.0,
         }
+
+    def get_battle_results(self) -> list[tuple[bool, str]]:
+        """Get individual battle results for this rollout.
+
+        Returns:
+            List of (won, opponent_type) tuples for each battle played.
+        """
+        return self._battle_results.copy()
 
 
 @dataclass
@@ -517,9 +541,6 @@ class Trainer:
         # Stats
         self.stats = TrainingStats()
         self._best_win_rate: float = 0.0  # Track for tuning
-
-        # Load existing best model's skill to avoid overwriting better models
-        self._global_best_skill = self._load_existing_best_skill()
 
         # Graceful shutdown
         self._shutdown_requested = False
@@ -1030,15 +1051,17 @@ class Trainer:
                 # Opponents must connect to the same server as their corresponding player
                 opponents = []
                 opponent_infos = []
+                opponent_types = []
                 for i in range(self.num_envs):
                     server_config = self.server_configs[i % len(self.server_configs)]
                     if self.self_play_manager:
-                        opponent, opponent_info = self.self_play_manager.get_opponent(
+                        opponent, opponent_info, opponent_type = self.self_play_manager.get_opponent(
                             self.config.battle_format,
                             server_configuration=server_config,
                         )
                         opponents.append(opponent)
                         opponent_infos.append(opponent_info)
+                        opponent_types.append(opponent_type)
                     else:
                         opponents.append(RandomPlayer(
                             battle_format=self.config.battle_format,
@@ -1046,6 +1069,10 @@ class Trainer:
                             server_configuration=server_config,
                         ))
                         opponent_infos.append(None)
+                        opponent_types.append("random")
+
+                    # Set opponent type on player for per-battle tracking
+                    players[i]._current_opponent_type = opponent_types[-1]
 
                 # Set model to eval mode once for the entire rollout (not per action)
                 self.model.eval()
@@ -1070,16 +1097,15 @@ class Trainer:
                     "avg_length": float(np.mean(all_lengths)) if all_lengths else 0.0,
                 }
 
-                # Update self-play stats per-environment (not aggregate)
-                # Each player tracks its own wins/losses against its opponent
+                # Update self-play stats using individual battle results (not rollout aggregates)
+                # This correctly tracks per-battle outcomes for rolling win rates
                 if self.self_play_manager:
                     for i, info in enumerate(opponent_infos):
-                        if info is not None and i < len(players):
+                        if i < len(players):
                             player = players[i]
-                            # Use this player's individual win rate against this opponent
-                            if player._rollout_battles > 0:
-                                player_won = player._rollout_wins > player._rollout_battles / 2
-                                self.self_play_manager.update_after_game(info, player_won)
+                            # Record each individual battle result
+                            for won, opp_type in player.get_battle_results():
+                                self.self_play_manager.update_after_game(info, won, opp_type)
 
                 # Add to buffer
                 total_added = self.add_experiences_to_buffer_parallel(all_env_experiences)
@@ -1113,15 +1139,19 @@ class Trainer:
 
                 # Update display
                 _, mem_percent = self.memory_monitor.check_memory()
+                # Get benchmark win rate (MaxDamage) for stable improvement tracking
+                benchmark_rate = None
+                if self.self_play_manager:
+                    sp_stats = self.self_play_manager.get_stats()
+                    benchmark_rate = sp_stats.get("rolling_win_rate_max_damage")
                 display.update(
                     timesteps=self.stats.total_timesteps,
                     rollout_stats=rollout_stats,
                     ppo_stats=ppo_stats,
-                    skill=self.self_play_manager.agent_skill if self.self_play_manager else None,
                     pool_size=self.self_play_manager.opponent_pool.size if self.self_play_manager else 0,
                     memory_str=self.memory_monitor.get_memory_status_string(),
                     memory_percent=mem_percent,
-                    best_skill=self._global_best_skill,
+                    benchmark_win_rate=benchmark_rate,
                 )
 
                 # Add checkpoint to self-play pool
@@ -1139,16 +1169,6 @@ class Trainer:
                 if rollout_stats["win_rate"] > self.stats.best_win_rate:
                     self.stats.best_win_rate = rollout_stats["win_rate"]
                     self._best_win_rate = rollout_stats["win_rate"]  # For tuning
-
-                # Save best_model.pt based on skill rating (not win rate, since win rate caps at 100%)
-                # Only save if we beat the global best from existing best_model.pt
-                if self.self_play_manager:
-                    current_skill = self.self_play_manager.agent_skill
-                    if current_skill > self._global_best_skill:
-                        old_best = self._global_best_skill
-                        self._global_best_skill = current_skill
-                        self._save_checkpoint("best_model.pt")
-                        display.message(f"NEW BEST MODEL! Skill: {old_best:.0f} -> {current_skill:.0f}")
 
                 # Clean up experience data to prevent memory accumulation
                 del all_env_experiences
@@ -1187,6 +1207,10 @@ class Trainer:
             display.close()
             if self._shutdown_requested or self.stats.total_timesteps > 0:
                 self._save_checkpoint("latest.pt")
+
+            # Save opponent pool metadata (skill ratings, win/loss stats)
+            if self.self_play_manager:
+                self.self_play_manager.opponent_pool.save_metadata()
 
             if self.writer:
                 self.writer.close()
@@ -1248,35 +1272,23 @@ class Trainer:
             self.writer.add_scalar("self_play/pool_size", sp_stats["pool_size"], step)
             self.writer.add_scalar("self_play/pool_avg_skill", sp_stats["pool_avg_skill"], step)
             self.writer.add_scalar("self_play/games_vs_self_play", sp_stats["games_vs_self_play"], step)
+            self.writer.add_scalar("self_play/games_vs_max_damage", sp_stats["games_vs_max_damage"], step)
             self.writer.add_scalar("self_play/games_vs_random", sp_stats["games_vs_random"], step)
+
+            # Benchmark metrics - rolling win rates by opponent type (last 100 games each)
+            # These are stable metrics for tracking absolute improvement
+            if sp_stats["rolling_win_rate_max_damage"] is not None:
+                self.writer.add_scalar("benchmark/win_rate_vs_max_damage", sp_stats["rolling_win_rate_max_damage"], step)
+            if sp_stats["rolling_win_rate_self_play"] is not None:
+                self.writer.add_scalar("benchmark/win_rate_vs_self_play", sp_stats["rolling_win_rate_self_play"], step)
+            if sp_stats["rolling_win_rate_random"] is not None:
+                self.writer.add_scalar("benchmark/win_rate_vs_random", sp_stats["rolling_win_rate_random"], step)
 
         # Inference server stats
         if self.inference_server:
             inf_stats = self.inference_server.get_stats()
             self.writer.add_scalar("inference/avg_batch_size", inf_stats["avg_batch_size"], step)
             self.writer.add_scalar("inference/total_batches", inf_stats["total_batches"], step)
-
-    def _load_existing_best_skill(self) -> float:
-        """Load the skill rating from existing best_model.pt if it exists.
-
-        This prevents overwriting a better model from a previous training run
-        with a worse model from a new run that starts fresh. Skill rating is
-        used instead of win rate because win rate caps at 100%, while skill
-        continues to grow as the model beats stronger opponents.
-        """
-        best_model_path = self.save_dir / "best_model.pt"
-        if best_model_path.exists():
-            try:
-                checkpoint = torch.load(best_model_path, map_location="cpu", weights_only=False)
-                skill = checkpoint.get("self_play", {}).get("agent_skill", 0.0)
-                steps = checkpoint.get("stats", {}).get("total_timesteps", 0)
-                print(f"Loaded best_model.pt: Skill={skill:.0f}, Steps={steps:,}")
-                return skill
-            except Exception as e:
-                print(f"Warning: Could not load best_model.pt: {e}")
-                return 0.0
-        print("No existing best_model.pt found, starting fresh")
-        return 0.0
 
     def _save_checkpoint(self, filename: str | None = None) -> None:
         """Save a training checkpoint.
@@ -1302,33 +1314,22 @@ class Trainer:
             "run_name": self._run_name,
         }
 
-        # Save self-play state
+        # Save self-play state including rolling win rate history
         if self.self_play_manager:
             checkpoint["self_play"] = {
                 "agent_skill": self.self_play_manager.agent_skill,
                 "last_checkpoint_timestep": self.self_play_manager.last_checkpoint_timestep,
                 "games_vs_self_play": self.self_play_manager.games_vs_self_play,
+                "games_vs_max_damage": self.self_play_manager.games_vs_max_damage,
                 "games_vs_random": self.self_play_manager.games_vs_random,
+                # Preserve rolling win rate history for Bench%/Win% continuity
+                "rolling_results_self_play": list(self.self_play_manager._results_self_play),
+                "rolling_results_max_damage": list(self.self_play_manager._results_max_damage),
+                "rolling_results_random": list(self.self_play_manager._results_random),
             }
 
         torch.save(checkpoint, path)
-
-        # Verify best_model.pt saves to ensure we don't lose the best model
-        if filename == "best_model.pt":
-            # Verify the save by reading it back
-            try:
-                verify = torch.load(path, map_location="cpu", weights_only=False)
-                saved_skill = verify.get("self_play", {}).get("agent_skill", 0)
-                saved_steps = verify.get("stats", {}).get("total_timesteps", 0)
-                expected_skill = checkpoint.get("self_play", {}).get("agent_skill", 0)
-                if abs(saved_skill - expected_skill) > 0.1:
-                    print(f"ERROR: best_model.pt verification failed! Expected skill {expected_skill}, got {saved_skill}")
-                else:
-                    print(f"Saved best_model.pt: Skill={saved_skill:.0f}, Steps={saved_steps:,} [VERIFIED]")
-            except Exception as e:
-                print(f"ERROR: Could not verify best_model.pt: {e}")
-        else:
-            print(f"Saved checkpoint: {path}")
+        print(f"Saved checkpoint: {path}")
 
         # Always update latest.pt when saving numbered checkpoints
         # This ensures resume works even after unexpected termination (kill/crash)
@@ -1449,7 +1450,19 @@ class Trainer:
             self.self_play_manager.agent_skill = sp_state.get("agent_skill", sp_state.get("agent_elo", 1000.0))
             self.self_play_manager.last_checkpoint_timestep = sp_state.get("last_checkpoint_timestep", 0)
             self.self_play_manager.games_vs_self_play = sp_state.get("games_vs_self_play", 0)
+            self.self_play_manager.games_vs_max_damage = sp_state.get("games_vs_max_damage", 0)
             self.self_play_manager.games_vs_random = sp_state.get("games_vs_random", 0)
+
+            # Restore rolling win rate history for Bench%/Win% continuity
+            if "rolling_results_self_play" in sp_state:
+                self.self_play_manager._results_self_play.clear()
+                self.self_play_manager._results_self_play.extend(sp_state["rolling_results_self_play"])
+            if "rolling_results_max_damage" in sp_state:
+                self.self_play_manager._results_max_damage.clear()
+                self.self_play_manager._results_max_damage.extend(sp_state["rolling_results_max_damage"])
+            if "rolling_results_random" in sp_state:
+                self.self_play_manager._results_random.clear()
+                self.self_play_manager._results_random.extend(sp_state["rolling_results_random"])
 
         print(f"Loaded checkpoint: {path}")
         print(f"  Timesteps: {self.stats.total_timesteps:,}")
@@ -1457,3 +1470,10 @@ class Trainer:
         print(f"  Best win rate: {self.stats.best_win_rate:.1%}")
         if self.self_play_manager and "self_play" in checkpoint:
             print(f"  Agent Skill: {self.self_play_manager.agent_skill:.0f}")
+            # Show restored rolling win rates if available
+            rates = self.self_play_manager.get_rolling_win_rates()
+            if rates["max_damage"] is not None:
+                print(f"  Bench (MaxDamage): {rates['max_damage']:.1%}")
+            if rates["self_play"] is not None:
+                print(f"  Win rate (Self-play): {rates['self_play']:.1%}")
+            print(f"  Opponent pool size: {self.self_play_manager.opponent_pool.size}")

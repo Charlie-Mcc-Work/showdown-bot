@@ -172,7 +172,7 @@ class StateEncoder:
         + 4  # Type effectiveness multiplier for each move slot (normalized 0-1)
     )
 
-    NUM_ACTIONS = 9  # 4 moves + 5 switches (in random battles, max 5 switches possible)
+    NUM_ACTIONS = 13  # 4 moves + 5 switches + 4 tera moves
 
     def __init__(self, device: torch.device | None = None):
         self.device = device or torch.device("cpu")
@@ -484,6 +484,7 @@ class StateEncoder:
         Actions:
         - 0-3: Moves
         - 4-8: Switch to team slot 0-4 (excluding active)
+        - 9-12: Tera moves (same moves but with terastallization)
         """
         mask = np.zeros(self.NUM_ACTIONS, dtype=np.float32)
 
@@ -493,6 +494,11 @@ class StateEncoder:
             available_moves = battle.available_moves
             for i, move in enumerate(available_moves[:4]):
                 mask[i] = 1.0
+
+            # Tera moves available if we can still tera
+            if battle.can_tera:
+                for i, move in enumerate(available_moves[:4]):
+                    mask[9 + i] = 1.0
 
         # Check available switches
         available_switches = battle.available_switches
@@ -518,22 +524,27 @@ class StateEncoder:
     ) -> BattleOrder | None:
         """Convert action index to poke-env battle order.
 
+        Actions:
+        - 0-3: Regular moves
+        - 4-8: Switch to team slot 0-4
+        - 9-12: Tera moves (same moves but with terastallization)
+
         Returns None if action is invalid.
         """
         # During forced switch, only switch actions are valid
         if battle.force_switch:
-            if action < 4:
+            if action < 4 or action >= 9:
                 # Model tried to use a move during forced switch - invalid
                 return None
             # Fall through to switch handling below
 
         if action < 4:
-            # Move action
+            # Regular move action
             available_moves = battle.available_moves
             if action < len(available_moves):
                 move = available_moves[action]
                 return SingleBattleOrder(move)
-        else:
+        elif action < 9:
             # Switch action
             switch_idx = action - 4
             available_switches = battle.available_switches
@@ -544,6 +555,17 @@ class StateEncoder:
                     idx = team_list.index(pokemon)
                     if idx == switch_idx:
                         return SingleBattleOrder(pokemon)
+        else:
+            # Tera move action (9-12)
+            move_idx = action - 9
+            available_moves = battle.available_moves
+            if move_idx < len(available_moves) and battle.can_tera:
+                move = available_moves[move_idx]
+                return SingleBattleOrder(order=move, terastallize=True)
+            elif move_idx < len(available_moves):
+                # Can't tera anymore, fall back to regular move
+                move = available_moves[move_idx]
+                return SingleBattleOrder(move)
 
         return None
 

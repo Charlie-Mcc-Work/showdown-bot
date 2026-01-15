@@ -31,7 +31,9 @@ while true; do
     total_speed=0
     total_wins=0
     total_games=0
-    best_skill=0
+    best_bench=0
+    bench_count=0
+    total_bench=0
     active_workers=0
 
     for log in logs/worker_*.log; do
@@ -63,10 +65,14 @@ while true; do
                 total_games=$((total_games + 1))
             fi
 
-            # Extract skill (e.g., "Skill:31428")
-            skill=$(echo "$line" | grep -oP 'Skill:\d+' | head -1 | grep -oP '\d+')
-            if [ -n "$skill" ] && [ "$skill" -gt "$best_skill" ]; then
-                best_skill=$skill
+            # Extract benchmark win rate (e.g., "Bench:70%" or "Bench: --")
+            bench=$(echo "$line" | grep -oP 'Bench:\s*\d+' | head -1 | grep -oP '\d+')
+            if [ -n "$bench" ]; then
+                total_bench=$((total_bench + bench))
+                bench_count=$((bench_count + 1))
+                if [ "$bench" -gt "$best_bench" ]; then
+                    best_bench=$bench
+                fi
             fi
         fi
     done
@@ -112,8 +118,16 @@ while true; do
         eta="--"
     fi
 
+    # Calculate average benchmark
+    if [ $bench_count -gt 0 ]; then
+        avg_bench=$((total_bench / bench_count))
+        bench_display="Bench:${avg_bench}%"
+    else
+        bench_display="Bench:--"
+    fi
+
     # Display combined stats (percentage and ETA right after progress bar)
-    echo -ne "\r[${bar}${bar_empty}] ${pct}% | ETA:${eta} | ${total_m}M | ${CYAN}${total_speed}/s${NC} | Workers:${active_workers}/${num_workers} | Win:${avg_win}% | Skill:${best_skill}    "
+    echo -ne "\r[${bar}${bar_empty}] ${pct}% | ETA:${eta} | ${total_m}M | ${CYAN}${total_speed}/s${NC} | Workers:${active_workers}/${num_workers} | Win:${avg_win}% | ${bench_display}    "
 
     sleep 2
 done

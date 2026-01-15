@@ -2,6 +2,7 @@
 
 import json
 import random
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -539,11 +540,11 @@ class SelfPlayManager:
         # Curriculum parameters
         curriculum_enabled: bool = True,
         curriculum_skill_min: float = 1000.0,
-        curriculum_skill_max: float = 5000.0,
+        curriculum_skill_max: float = 6000.0,
         curriculum_early_self_play: float = 0.3,
-        curriculum_early_max_damage: float = 0.4,
-        curriculum_late_self_play: float = 0.8,
-        curriculum_late_max_damage: float = 0.15,
+        curriculum_early_max_damage: float = 0.7,
+        curriculum_late_self_play: float = 0.95,
+        curriculum_late_max_damage: float = 0.05,
     ):
         """Initialize self-play manager.
 
@@ -589,6 +590,13 @@ class SelfPlayManager:
         self.games_vs_self_play = 0
         self.games_vs_max_damage = 0
         self.games_vs_random = 0
+
+        # Rolling win rate tracking (last N games per opponent type)
+        # This provides stable benchmark metrics independent of Elo fluctuations
+        self._rolling_window = 100
+        self._results_self_play: deque[bool] = deque(maxlen=self._rolling_window)
+        self._results_max_damage: deque[bool] = deque(maxlen=self._rolling_window)
+        self._results_random: deque[bool] = deque(maxlen=self._rolling_window)
 
     def get_curriculum_ratios(self) -> tuple[float, float, float]:
         """Get current opponent ratios based on skill level.
@@ -673,7 +681,7 @@ class SelfPlayManager:
         self,
         battle_format: str,
         server_configuration: ServerConfiguration | None = None,
-    ) -> tuple[Player, OpponentInfo | None]:
+    ) -> tuple[Player, OpponentInfo | None, str]:
         """Get an opponent to play against using curriculum-based selection.
 
         Args:
@@ -681,7 +689,8 @@ class SelfPlayManager:
             server_configuration: Server to connect to (None for default)
 
         Returns:
-            Tuple of (opponent_player, opponent_info or None for non-self-play)
+            Tuple of (opponent_player, opponent_info or None, opponent_type)
+            opponent_type is one of: "self_play", "max_damage", "random"
         """
         from poke_env.player import RandomPlayer
         from showdown_bot.environment.battle_env import MaxDamagePlayer
@@ -698,7 +707,7 @@ class SelfPlayManager:
                     opponent_info, battle_format, server_configuration
                 )
                 self.games_vs_self_play += 1
-                return player, opponent_info
+                return player, opponent_info, "self_play"
             # Fallback if sampling failed
             opponent_type = "max_damage"
 
@@ -708,7 +717,7 @@ class SelfPlayManager:
                 battle_format=battle_format,
                 max_concurrent_battles=1,
                 server_configuration=server_configuration,
-            ), None
+            ), None, "max_damage"
 
         # Random
         self.games_vs_random += 1
@@ -716,28 +725,58 @@ class SelfPlayManager:
             battle_format=battle_format,
             max_concurrent_battles=1,
             server_configuration=server_configuration,
-        ), None
+        ), None, "random"
 
     def update_after_game(
         self,
         opponent_info: OpponentInfo | None,
         won: bool,
+        opponent_type: str = "self_play",
     ) -> None:
         """Update statistics after a game.
 
         Args:
-            opponent_info: The opponent played (None for random)
+            opponent_info: The opponent played (None for non-self-play)
             won: Whether the agent won
+            opponent_type: Type of opponent ("self_play", "max_damage", "random")
         """
+        # Update Elo only for self-play games
         if opponent_info is not None:
             self.agent_skill, _ = self.opponent_pool.update_stats(
                 opponent_info, won, self.agent_skill
             )
 
+        # Track rolling win rates for all opponent types
+        if opponent_type == "self_play":
+            self._results_self_play.append(won)
+        elif opponent_type == "max_damage":
+            self._results_max_damage.append(won)
+        elif opponent_type == "random":
+            self._results_random.append(won)
+
+    def get_rolling_win_rates(self) -> dict[str, float | None]:
+        """Get rolling win rates for each opponent type.
+
+        Returns:
+            Dict with win rates (0.0-1.0) or None if no games played yet.
+            Keys: "self_play", "max_damage", "random"
+        """
+        def calc_rate(results: deque[bool]) -> float | None:
+            if not results:
+                return None
+            return sum(results) / len(results)
+
+        return {
+            "self_play": calc_rate(self._results_self_play),
+            "max_damage": calc_rate(self._results_max_damage),
+            "random": calc_rate(self._results_random),
+        }
+
     def get_stats(self) -> dict[str, Any]:
         """Get self-play statistics."""
         total_games = self.games_vs_self_play + self.games_vs_max_damage + self.games_vs_random
         self_play_ratio, max_damage_ratio, random_ratio = self.get_curriculum_ratios()
+        rolling_rates = self.get_rolling_win_rates()
         return {
             "agent_skill": self.agent_skill,
             "pool_size": self.opponent_pool.size,
@@ -755,4 +794,8 @@ class SelfPlayManager:
             "curriculum_self_play_target": self_play_ratio,
             "curriculum_max_damage_target": max_damage_ratio,
             "curriculum_random_target": random_ratio,
+            # Rolling win rates (last 100 games per opponent type) - BENCHMARK METRICS
+            "rolling_win_rate_self_play": rolling_rates["self_play"],
+            "rolling_win_rate_max_damage": rolling_rates["max_damage"],
+            "rolling_win_rate_random": rolling_rates["random"],
         }

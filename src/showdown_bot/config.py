@@ -43,19 +43,19 @@ class TrainingConfig(BaseSettings):
     )
     # Early stage ratios (when skill <= curriculum_skill_min)
     curriculum_early_self_play: float = Field(
-        default=0.2, description="Self-play ratio in early training"
+        default=0.3, description="Self-play ratio in early training"
     )
     curriculum_early_max_damage: float = Field(
-        default=0.5, description="MaxDamage ratio in early training"
+        default=0.7, description="MaxDamage ratio in early training (learn fundamentals)"
     )
     # Late stage ratios (when skill >= curriculum_skill_max)
     curriculum_late_self_play: float = Field(
-        default=0.6, description="Self-play ratio in late training (reduced to avoid echo chamber)"
+        default=0.95, description="Self-play ratio in late training (AlphaZero-style)"
     )
     curriculum_late_max_damage: float = Field(
-        default=0.4, description="MaxDamage ratio in late training (teaches optimal damage calc)"
+        default=0.05, description="MaxDamage ratio in late training (sanity check only)"
     )
-    # Random ratio = 1 - self_play - max_damage (0% at late stage - random provides no signal)
+    # Random ratio = 1 - self_play - max_damage (always 0% - random provides no learning signal)
 
     # Environment
     num_envs: int = Field(default=8, description="Number of parallel environments")
