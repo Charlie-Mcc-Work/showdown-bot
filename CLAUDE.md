@@ -98,9 +98,10 @@ python scripts/coach_server.py
 
 ## Architecture
 
-- **Algorithm**: PPO with GAE
+- **Algorithm**: PPO with GAE, target_kl=0.015 for stability
 - **Model**: Transformer encoder with attention over Pokemon/moves
-- **Training**: Self-play against historical checkpoints
+- **Training**: Pure self-play (current model vs itself)
+- **Evaluation**: Periodic benchmark against MaxDamage (every 50k steps)
 - **Action space**: 4 moves + 5 switches (+ tera variants for OU)
 
 ## Training Features
@@ -108,26 +109,17 @@ python scripts/coach_server.py
 ### Learning Rate Scheduling
 Linear decay from `3e-4` → `3e-5` over training. Prevents late-stage oscillation.
 
-### Curriculum Opponent Selection
-Opponent mix adjusts based on Bench% (win rate vs MaxDamage):
+### Self-Play Training
+- **Training**: 100% self-play (current model vs itself)
+- **Evaluation**: 50 games vs MaxDamage every 50k steps (Bench% metric)
+- MaxDamage is only used for benchmarking, not training
+- This ensures the agent learns that opponents can switch from the start
 
-| Stage | Self-Play | MaxDamage |
-|-------|-----------|-----------|
-| Early (Bench <30%) | 30% | 70% |
-| Late (Bench >70%) | 95% | 5% |
-
-- **MaxDamage**: Deterministic optimal-damage player, teaches damage calculations
-- **Self-play**: Historical checkpoints with diverse sampling
-- Model graduates to more self-play only after proving it can beat MaxDamage
-
-### Diverse Opponent Sampling
-Self-play uses mixed sampling to avoid echo chambers:
-- 40% uniform (any opponent in pool)
-- 30% challenge (prefer stronger opponents)
-- 30% skill-matched (similar skill level)
-
-### Opponent Pool Diversity
-Pool pruning keeps: oldest (weak baseline), newest, best, worst, plus skill-diverse selection.
+### Why Not Train Against MaxDamage?
+MaxDamage never switches and plays predictably. Training against it teaches:
+- Never switch (opponent won't punish it)
+- Pure aggression is optimal
+These habits hurt against real opponents. MaxDamage is useful as a benchmark only.
 
 ## Technical Notes
 
@@ -137,4 +129,21 @@ Pool pruning keeps: oldest (weak baseline), newest, best, worst, plus skill-dive
 - Battle request at `app.curRoom.request` (not `.battle.request`)
 - Optimal config: 1 PS server, 6 envs per process (~290/s single, ~500/s multi)
 - Multi-process training uses 2 workers to bypass Python's GIL
-- Entropy coefficient: 0.025 (encourages exploration)
+- Entropy coefficient: 0.01 (balanced exploration)
+
+## Planned Improvements
+
+### Best Checkpoint Gating (AlphaZero-style)
+Add a "best" checkpoint that gates model promotion:
+
+- **Training**: 100% self-play (current vs current) - unchanged
+- **Evaluation every 100k steps**:
+  - 50 games vs MaxDamage → Bench% (absolute skill metric)
+  - 150 games vs Best → promotion gate
+- **Promotion**: If current beats best ≥60%, current becomes new best
+
+Benefits:
+- Prevents regression (best only updates when convincingly beaten)
+- MaxDamage catches "learned to beat itself but forgot fundamentals"
+- Best checkpoint catches "got worse at the game overall"
+- 60% threshold prevents noisy promotions

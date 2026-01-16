@@ -170,6 +170,8 @@ class StateEncoder:
         + 1  # Num opponent Pokemon unrevealed (0-1 normalized)
         # Type effectiveness (for active moves vs opponent active)
         + 4  # Type effectiveness multiplier for each move slot (normalized 0-1)
+        # Damage estimates (like MaxDamage calculates)
+        + 4  # Estimated damage for each move slot (normalized 0-1)
     )
 
     NUM_ACTIONS = 13  # 4 moves + 5 switches + 4 tera moves
@@ -463,7 +465,89 @@ class StateEncoder:
                 # No move in this slot or no opponent active - neutral effectiveness
                 features.append(0.25)  # 1.0 / 4.0 = neutral
 
+        # Damage estimates for each move (like MaxDamage calculates)
+        # This gives the model the same information MaxDamage uses
+        user_active = battle.active_pokemon
+        for i in range(4):
+            if i < len(available_moves) and opponent_active is not None and user_active is not None:
+                move = available_moves[i]
+                damage_estimate = self._estimate_damage(move, user_active, opponent_active)
+                # Normalize: assume max reasonable damage is ~200 base power equivalent
+                # after all multipliers, cap at 1.0
+                features.append(min(damage_estimate / 200.0, 1.0))
+            else:
+                features.append(0.0)
+
         return np.array(features, dtype=np.float32)
+
+    def _estimate_damage(self, move: Move, attacker: Pokemon, defender: Pokemon) -> float:
+        """Estimate damage for a move, similar to MaxDamage calculation.
+
+        Returns a normalized damage value (not actual HP damage, but relative strength).
+        """
+        # Status moves do no damage
+        if move.category.name.lower() == "status":
+            return 0.0
+
+        base_power = move.base_power or 0
+        if base_power == 0:
+            return 0.0
+
+        # Type effectiveness (0.25, 0.5, 1, 2, or 4)
+        type_mult = defender.damage_multiplier(move)
+
+        # STAB (Same Type Attack Bonus) - 1.5x if move type matches attacker's type
+        stab = 1.0
+        if move.type:
+            if move.type == attacker.type_1 or move.type == attacker.type_2:
+                stab = 1.5
+
+        # Get stats - use stats if available, fall back to base_stats
+        # For opponent Pokemon, we may only have base_stats
+        def get_stat(pokemon: Pokemon, stat: str, default: int = 100) -> int:
+            if pokemon.stats:
+                val = pokemon.stats.get(stat)
+                if val is not None:
+                    return val
+            if pokemon.base_stats:
+                val = pokemon.base_stats.get(stat)
+                if val is not None:
+                    return val
+            return default
+
+        # Attack vs Defense ratio
+        # For physical moves: Attack vs Defense
+        # For special moves: Special Attack vs Special Defense
+        if move.category.name.lower() == "physical":
+            atk_stat = get_stat(attacker, "atk")
+            def_stat = get_stat(defender, "def")
+            atk_boost_key = "atk"
+            def_boost_key = "def"
+        else:  # special
+            atk_stat = get_stat(attacker, "spa")
+            def_stat = get_stat(defender, "spd")
+            atk_boost_key = "spa"
+            def_boost_key = "spd"
+
+        # Include stat boosts
+        atk_boost = attacker.boosts.get(atk_boost_key, 0)
+        def_boost = defender.boosts.get(def_boost_key, 0)
+
+        # Boost multipliers: +1 = 1.5x, +2 = 2x, etc. (simplified)
+        atk_mult = max(2, 2 + atk_boost) / 2 if atk_boost >= 0 else 2 / max(2, 2 - atk_boost)
+        def_mult = max(2, 2 + def_boost) / 2 if def_boost >= 0 else 2 / max(2, 2 - def_boost)
+
+        atk_effective = atk_stat * atk_mult
+        def_effective = def_stat * def_mult
+
+        # Avoid division by zero
+        if def_effective == 0:
+            def_effective = 1
+
+        # Simplified damage formula (proportional, not exact Pokemon formula)
+        damage = base_power * stab * type_mult * (atk_effective / def_effective)
+
+        return damage
 
     def _get_active_index(
         self,

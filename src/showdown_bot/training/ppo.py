@@ -252,6 +252,7 @@ class PPO:
             entropy_coef=cfg.entropy_coef,
             max_grad_norm=cfg.max_grad_norm,
             num_epochs=cfg.num_epochs,
+            target_kl=cfg.target_kl,
             device=device,
         )
 

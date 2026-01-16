@@ -4,6 +4,7 @@
 # - Resumes from checkpoint or best model
 # - Restarts on memory issues or run completion
 # - Ctrl+C gracefully exits everything
+# - Supports named experiments for comparison testing
 
 set -e
 
@@ -15,6 +16,11 @@ TIMESTEPS=5000000  # 5M steps per run
 DEVICE="cuda"  # Use GPU by default
 MULTIPROC=false  # Use multi-process training (bypasses GIL)
 NUM_WORKERS=1  # Only used in multiproc mode
+SELF_PLAY_START=false  # Start with self-play instead of MaxDamage
+ENTROPY_COEF=0.05  # Entropy coefficient for exploration
+BENCHMARK_GAMES=50  # MaxDamage benchmark games per checkpoint
+EXPERIMENT=""  # Experiment name for organizing outputs
+USE_SINGLE_PROCESS=false  # Use original train.py with full curriculum
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -43,6 +49,26 @@ while [[ $# -gt 0 ]]; do
             NUM_WORKERS="$2"
             shift 2
             ;;
+        --self-play-start)
+            SELF_PLAY_START=true
+            shift
+            ;;
+        --entropy-coef)
+            ENTROPY_COEF="$2"
+            shift 2
+            ;;
+        --benchmark-games)
+            BENCHMARK_GAMES="$2"
+            shift 2
+            ;;
+        --experiment|-x)
+            EXPERIMENT="$2"
+            shift 2
+            ;;
+        --single-process|-s)
+            USE_SINGLE_PROCESS=true
+            shift
+            ;;
         -h|--help)
             echo "Usage: $0 [options]"
             echo "Options:"
@@ -50,14 +76,20 @@ while [[ $# -gt 0 ]]; do
             echo "  --num-servers N   Number of PS servers to start (default: 1)"
             echo "  --multiproc, -m   Use multi-process training (bypasses GIL)"
             echo "  --workers N       Number of workers for multiproc (default: 2)"
+            echo "  --self-play-start Start with self-play instead of MaxDamage (fresh start only)"
+            echo "  --entropy-coef N  Entropy coefficient for exploration (default: 0.05)"
+            echo "  --benchmark-games N  MaxDamage benchmark games per checkpoint (default: 50)"
             echo "  --timesteps N     Steps per training run (default: 5000000)"
             echo "  --device DEV      Device: cuda, cpu (default: cuda)"
+            echo "  --experiment, -x  Experiment name (creates separate checkpoint/log dirs)"
+            echo "  --single-process, -s  Use original train.py with full curriculum (~290/s)"
             echo "  -h, --help        Show this help"
             echo ""
             echo "Examples:"
-            echo "  $0                    # Single-process, 1 server, 6 envs (~290/s)"
-            echo "  $0 --multiproc        # Multi-process, 2 workers x 6 envs (~450/s)"
-            echo "  $0 -m --workers 3     # Multi-process with 3 workers (~550/s?)"
+            echo "  $0                              # Multi-process vs best only (~550/s)"
+            echo "  $0 -s                           # Single-process with curriculum (~290/s)"
+            echo "  $0 -x test1 -m --entropy-coef 0.1  # Named experiment"
+            echo "  $0 -x curriculum -s             # Single-process experiment"
             exit 0
             ;;
         *)
@@ -68,13 +100,30 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Auto-scale servers based on mode
-if [ "$MULTIPROC" = true ]; then
+if [ "$USE_SINGLE_PROCESS" = true ]; then
+    # Single-process mode uses train.py
+    MULTIPROC=false
+    NUM_WORKERS=1
+elif [ "$MULTIPROC" = true ]; then
     # Multi-process: default to 2 workers if not specified
     [ "$NUM_WORKERS" -eq 1 ] && NUM_WORKERS=2
     # Auto-scale servers to match workers
     [ "$NUM_SERVERS" -eq 1 ] && NUM_SERVERS=$NUM_WORKERS
 fi
 TOTAL_ENVS=$((NUM_WORKERS * NUM_ENVS))
+
+# Set up experiment directories
+if [ -n "$EXPERIMENT" ]; then
+    CHECKPOINT_DIR="data/experiments/$EXPERIMENT/checkpoints"
+    LOG_DIR="data/experiments/$EXPERIMENT/runs"
+    LOG_FILE_DIR="data/experiments/$EXPERIMENT/logs"
+    SELF_PLAY_DIR="data/experiments/$EXPERIMENT/opponents"
+else
+    CHECKPOINT_DIR="data/checkpoints"
+    LOG_DIR="runs"
+    LOG_FILE_DIR="logs"
+    SELF_PLAY_DIR="data/opponents"
+fi
 
 PS_DIR="$HOME/pokemon-showdown"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -189,17 +238,28 @@ main() {
     echo -e "${GREEN}  Pokemon Showdown RL Training Script${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
-    if [ "$MULTIPROC" = true ]; then
-        echo -e "Mode: ${BLUE}Multi-Process${NC} (bypasses GIL)"
+    if [ -n "$EXPERIMENT" ]; then
+        echo -e "Experiment: ${YELLOW}$EXPERIMENT${NC}"
+    fi
+    if [ "$USE_SINGLE_PROCESS" = true ]; then
+        echo -e "Mode: ${BLUE}Single-Process + Curriculum${NC} (train.py)"
+        echo -e "Training: ${BLUE}Curriculum${NC} (70% MaxDamage early → 95% self-play late)"
+    elif [ "$MULTIPROC" = true ]; then
+        echo -e "Mode: ${BLUE}Multi-Process${NC} (train_multiproc.py)"
         echo -e "Workers: ${BLUE}$NUM_WORKERS${NC} (separate processes)"
+        echo -e "Training: ${BLUE}Current vs Best${NC} (simplified)"
     else
-        echo -e "Mode: ${BLUE}Single-Process${NC}"
+        echo -e "Mode: ${BLUE}Single-Process${NC} (train_multiproc.py)"
+        echo -e "Training: ${BLUE}Current vs Best${NC} (simplified)"
     fi
     echo -e "Servers: ${BLUE}$NUM_SERVERS${NC} (ports $BASE_PORT-$((BASE_PORT + NUM_SERVERS - 1)))"
     echo -e "Envs/worker: ${BLUE}$NUM_ENVS${NC}"
     echo -e "Total battles: ${BLUE}$((NUM_WORKERS * NUM_ENVS))${NC}"
     echo -e "Device: ${BLUE}$DEVICE${NC}"
     echo -e "Steps per run: ${BLUE}$TIMESTEPS${NC}"
+    echo -e "Entropy coef: ${BLUE}$ENTROPY_COEF${NC}"
+    echo -e "Benchmark games: ${BLUE}$BENCHMARK_GAMES${NC}"
+    echo -e "Checkpoints: ${BLUE}$CHECKPOINT_DIR${NC}"
     echo ""
 
     # Start servers
@@ -219,8 +279,37 @@ main() {
 
     PORTS=$(build_ports_arg)
     RUN_COUNT=0
-    CHECKPOINT_DIR="data/checkpoints"
+    # CHECKPOINT_DIR already set based on experiment name
     LATEST_MODEL="$CHECKPOINT_DIR/latest.pt"
+
+    # Create directories if needed
+    mkdir -p "$CHECKPOINT_DIR" "$LOG_DIR" "$LOG_FILE_DIR" "$SELF_PLAY_DIR"
+
+    # Save experiment config for tracking
+    if [ -n "$EXPERIMENT" ]; then
+        CONFIG_FILE="data/experiments/$EXPERIMENT/config.txt"
+        cat > "$CONFIG_FILE" << EOF
+# Experiment: $EXPERIMENT
+# Created: $(date)
+# Git commit: $(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+
+MODE=$([ "$USE_SINGLE_PROCESS" = true ] && echo "single-process-curriculum" || ([ "$MULTIPROC" = true ] && echo "multi-process" || echo "single-process"))
+TRAIN_SCRIPT=$([ "$USE_SINGLE_PROCESS" = true ] && echo "train.py" || echo "train_multiproc.py")
+NUM_WORKERS=$NUM_WORKERS
+NUM_ENVS=$NUM_ENVS
+TOTAL_ENVS=$TOTAL_ENVS
+NUM_SERVERS=$NUM_SERVERS
+TIMESTEPS=$TIMESTEPS
+DEVICE=$DEVICE
+ENTROPY_COEF=$ENTROPY_COEF
+BENCHMARK_GAMES=$BENCHMARK_GAMES
+SELF_PLAY_START=$SELF_PLAY_START
+
+# Command to reproduce:
+# ./scripts/run_training.sh -x $EXPERIMENT $([ "$USE_SINGLE_PROCESS" = true ] && echo "-s" || ([ "$MULTIPROC" = true ] && echo "-m --workers $NUM_WORKERS")) --num-envs $NUM_ENVS --entropy-coef $ENTROPY_COEF --benchmark-games $BENCHMARK_GAMES$([ "$SELF_PLAY_START" = true ] && echo " --self-play-start")
+EOF
+        echo -e "${BLUE}Saved config to: $CONFIG_FILE${NC}"
+    fi
 
     # Training loop - continues until Ctrl+C
     while true; do
@@ -237,6 +326,7 @@ main() {
         echo -e "${GREEN}========================================${NC}"
 
         RESUME_ARG=""
+        SELF_PLAY_ARG=""
         if [ -f "$LATEST_MODEL" ]; then
             STEPS=$(python -c "
 import torch
@@ -247,32 +337,58 @@ print(cp.get('stats', {}).get('total_timesteps', 0))
             RESUME_ARG="--resume $LATEST_MODEL"
         else
             echo -e "${YELLOW}No checkpoint found, starting fresh${NC}"
+            if [ "$SELF_PLAY_START" = true ]; then
+                SELF_PLAY_ARG="--self-play-start"
+                echo -e "${BLUE}Using self-play start (initial opponent = untrained model)${NC}"
+            fi
         fi
         echo ""
 
         # Run training
         # Exit code 0 = normal completion (including memory soft limit)
         # Exit code 130 = SIGINT (Ctrl+C)
-        mkdir -p logs
         set +e  # Don't exit on error
-        if [ "$MULTIPROC" = true ]; then
-            # Multi-process training (bypasses GIL, uses separate processes)
-            stdbuf -oL python -u scripts/train_multiproc.py \
-                $RESUME_ARG \
-                --workers $NUM_WORKERS \
-                --envs-per-worker $NUM_ENVS \
-                --server-ports $PORTS \
-                --timesteps $TIMESTEPS \
-                --device $DEVICE 2>&1 | tee logs/worker_0.log
-            EXIT_CODE=${PIPESTATUS[0]}
-        else
-            # Single-process training
+        if [ "$USE_SINGLE_PROCESS" = true ]; then
+            # Single-process with full curriculum (original train.py)
             stdbuf -oL python -u scripts/train.py \
                 $RESUME_ARG \
                 --num-envs $NUM_ENVS \
                 --server-ports $PORTS \
                 --timesteps $TIMESTEPS \
-                --device $DEVICE 2>&1 | tee logs/worker_0.log
+                --device $DEVICE \
+                --save-dir "$CHECKPOINT_DIR" \
+                --log-dir "$LOG_DIR" \
+                --self-play-dir "$SELF_PLAY_DIR" 2>&1 | tee "$LOG_FILE_DIR/worker_0.log"
+            EXIT_CODE=${PIPESTATUS[0]}
+        elif [ "$MULTIPROC" = true ]; then
+            # Multi-process training (bypasses GIL, uses separate processes)
+            stdbuf -oL python -u scripts/train_multiproc.py \
+                $RESUME_ARG \
+                $SELF_PLAY_ARG \
+                --workers $NUM_WORKERS \
+                --envs-per-worker $NUM_ENVS \
+                --server-ports $PORTS \
+                --timesteps $TIMESTEPS \
+                --device $DEVICE \
+                --entropy-coef $ENTROPY_COEF \
+                --benchmark-games $BENCHMARK_GAMES \
+                --save-dir "$CHECKPOINT_DIR" \
+                --log-dir "$LOG_DIR" 2>&1 | tee "$LOG_FILE_DIR/worker_0.log"
+            EXIT_CODE=${PIPESTATUS[0]}
+        else
+            # Single-process multiproc trainer (no curriculum)
+            stdbuf -oL python -u scripts/train_multiproc.py \
+                $RESUME_ARG \
+                $SELF_PLAY_ARG \
+                --workers 1 \
+                --envs-per-worker $NUM_ENVS \
+                --server-ports $PORTS \
+                --timesteps $TIMESTEPS \
+                --device $DEVICE \
+                --entropy-coef $ENTROPY_COEF \
+                --benchmark-games $BENCHMARK_GAMES \
+                --save-dir "$CHECKPOINT_DIR" \
+                --log-dir "$LOG_DIR" 2>&1 | tee "$LOG_FILE_DIR/worker_0.log"
             EXIT_CODE=${PIPESTATUS[0]}
         fi
         set -e

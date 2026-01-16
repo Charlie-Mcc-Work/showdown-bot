@@ -261,7 +261,13 @@ class TrainingDisplay:
 
 
 class TrainablePlayer(Player):
-    """A player that collects experiences for training."""
+    """A player that collects experiences for training.
+
+    IMPORTANT: Rewards are attributed to the action that caused them.
+    - At turn t, we take action A_t
+    - At turn t+1, we see the result and assign the HP-delta reward to experience t
+    - Terminal reward (win/loss) is assigned to the last experience
+    """
 
     def __init__(
         self,
@@ -284,6 +290,8 @@ class TrainablePlayer(Player):
         self.current_experiences: list[dict[str, Any]] = []
         self.prev_hp_fraction: float | None = None
         self.prev_opp_hp_fraction: float | None = None
+        self.prev_our_fainted: int = 0
+        self.prev_opp_fainted: int = 0
 
         # Statistics - track per rollout, not cumulative
         self.episode_rewards: list[float] = []
@@ -331,20 +339,40 @@ class TrainablePlayer(Player):
             log_prob_val = log_prob.item()
             value_val = value.item()
 
-        # Calculate reward
-        reward = calculate_reward(
-            battle,
-            self.prev_hp_fraction,
-            self.prev_opp_hp_fraction,
-        )
-
-        # Update HP tracking
+        # Calculate current HP state
         our_remaining = [p for p in battle.team.values() if not p.fainted]
         opp_remaining = [p for p in battle.opponent_team.values() if not p.fainted]
-        self.prev_hp_fraction = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
-        self.prev_opp_hp_fraction = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
+        current_our_hp = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
+        current_opp_hp = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
+        current_our_fainted = sum(1 for p in battle.team.values() if p.fainted)
+        current_opp_fainted = sum(1 for p in battle.opponent_team.values() if p.fainted)
 
-        # Store experience
+        # FIXED: Attribute reward to the PREVIOUS experience (the action that caused this state)
+        if self.current_experiences and self.prev_hp_fraction is not None:
+            # HP differential reward - attributed to previous action
+            our_hp_delta = current_our_hp - self.prev_hp_fraction
+            opp_hp_delta = current_opp_hp - self.prev_opp_hp_fraction
+
+            # KO differential (only the delta, not cumulative)
+            our_ko_delta = current_our_fainted - self.prev_our_fainted
+            opp_ko_delta = current_opp_fainted - self.prev_opp_fainted
+
+            # Reward for the action that caused this transition
+            intermediate_reward = 0.0
+            intermediate_reward += 0.1 * (-opp_hp_delta)  # Positive when opponent loses HP
+            intermediate_reward += 0.1 * our_hp_delta  # Positive when we don't lose HP
+            intermediate_reward += 0.1 * (opp_ko_delta - our_ko_delta)  # Bonus for KOs
+
+            # Update the PREVIOUS experience with this reward
+            self.current_experiences[-1]["reward"] = intermediate_reward
+
+        # Update HP tracking for next turn
+        self.prev_hp_fraction = current_our_hp
+        self.prev_opp_hp_fraction = current_opp_hp
+        self.prev_our_fainted = current_our_fainted
+        self.prev_opp_fainted = current_opp_fainted
+
+        # Store experience with reward=0 (will be filled next turn or at game end)
         self.current_experiences.append({
             "player_pokemon": state.player_pokemon.numpy(),
             "opponent_pokemon": state.opponent_pokemon.numpy(),
@@ -355,7 +383,7 @@ class TrainablePlayer(Player):
             "action": action_idx,
             "log_prob": log_prob_val,
             "value": value_val,
-            "reward": reward,
+            "reward": 0.0,  # Will be filled when we see the result
             "done": False,
         })
 
@@ -385,9 +413,9 @@ class TrainablePlayer(Player):
         # Track individual battle result for rolling win rate
         self._battle_results.append((won, self._current_opponent_type))
 
-        # Update last experience with terminal reward
+        # Add terminal reward to last experience
         if self.current_experiences:
-            self.current_experiences[-1]["reward"] = final_reward
+            self.current_experiences[-1]["reward"] += final_reward
             self.current_experiences[-1]["done"] = True
 
             # Track episode stats
@@ -398,6 +426,8 @@ class TrainablePlayer(Player):
         # Reset for next battle
         self.prev_hp_fraction = None
         self.prev_opp_hp_fraction = None
+        self.prev_our_fainted = 0
+        self.prev_opp_fainted = 0
 
     def get_experiences(self) -> list[dict[str, Any]]:
         """Get collected experiences and clear the buffer."""

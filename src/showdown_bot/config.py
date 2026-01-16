@@ -13,9 +13,10 @@ class TrainingConfig(BaseSettings):
     gamma: float = Field(default=0.99, description="Discount factor for rewards")
     gae_lambda: float = Field(default=0.95, description="GAE lambda for advantage estimation")
     clip_epsilon: float = Field(default=0.2, description="PPO clipping parameter")
-    entropy_coef: float = Field(default=0.01, description="Entropy bonus coefficient (higher = more exploration)")
+    entropy_coef: float = Field(default=0.05, description="Entropy bonus coefficient (higher = more exploration)")
     value_coef: float = Field(default=0.5, description="Value loss coefficient")
     max_grad_norm: float = Field(default=0.5, description="Max gradient norm for clipping")
+    target_kl: float | None = Field(default=0.015, description="Target KL divergence for early stopping (None to disable)")
 
     # Training schedule
     num_epochs: int = Field(default=4, description="PPO epochs per update")

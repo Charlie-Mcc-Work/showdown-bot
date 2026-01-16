@@ -90,7 +90,13 @@ def worker_process(
     )
 
     class WorkerTrainablePlayer(Player):
-        """Player that collects experiences for this worker."""
+        """Player that collects experiences for this worker.
+
+        IMPORTANT: Rewards are attributed to the action that caused them.
+        - At turn t, we take action A_t
+        - At turn t+1, we see the result and assign the HP-delta reward to experience t
+        - Terminal reward (win/loss) is assigned to the last experience
+        """
 
         def __init__(self, model, state_encoder, dev, **kwargs):
             super().__init__(**kwargs)
@@ -100,6 +106,8 @@ def worker_process(
             self.current_experiences = []
             self.prev_hp_fraction = None
             self.prev_opp_hp_fraction = None
+            self.prev_our_fainted = 0
+            self.prev_opp_fainted = 0
             self._won = None
 
         def choose_move(self, battle: AbstractBattle):
@@ -123,13 +131,40 @@ def worker_process(
             log_prob_val = log_prob.item()
             value_val = value.item()
 
-            reward = calculate_reward(battle, self.prev_hp_fraction, self.prev_opp_hp_fraction)
-
+            # Calculate current HP state
             our_remaining = [p for p in battle.team.values() if not p.fainted]
             opp_remaining = [p for p in battle.opponent_team.values() if not p.fainted]
-            self.prev_hp_fraction = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
-            self.prev_opp_hp_fraction = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
+            current_our_hp = sum(p.current_hp_fraction for p in our_remaining) / max(1, len(our_remaining))
+            current_opp_hp = sum(p.current_hp_fraction for p in opp_remaining) / max(1, len(opp_remaining))
+            current_our_fainted = sum(1 for p in battle.team.values() if p.fainted)
+            current_opp_fainted = sum(1 for p in battle.opponent_team.values() if p.fainted)
 
+            # FIXED: Attribute reward to the PREVIOUS experience (the action that caused this state)
+            if self.current_experiences and self.prev_hp_fraction is not None:
+                # HP differential reward - attributed to previous action
+                our_hp_delta = current_our_hp - self.prev_hp_fraction
+                opp_hp_delta = current_opp_hp - self.prev_opp_hp_fraction
+
+                # KO differential (only the delta, not cumulative)
+                our_ko_delta = current_our_fainted - self.prev_our_fainted
+                opp_ko_delta = current_opp_fainted - self.prev_opp_fainted
+
+                # Reward for the action that caused this transition
+                intermediate_reward = 0.0
+                intermediate_reward += 0.1 * (-opp_hp_delta)  # Positive when opponent loses HP
+                intermediate_reward += 0.1 * our_hp_delta  # Positive when we don't lose HP
+                intermediate_reward += 0.1 * (opp_ko_delta - our_ko_delta)  # Bonus for KOs
+
+                # Update the PREVIOUS experience with this reward
+                self.current_experiences[-1]["reward"] = intermediate_reward
+
+            # Update tracking for next turn
+            self.prev_hp_fraction = current_our_hp
+            self.prev_opp_hp_fraction = current_opp_hp
+            self.prev_our_fainted = current_our_fainted
+            self.prev_opp_fainted = current_opp_fainted
+
+            # Store current experience with reward=0 (will be filled next turn or at game end)
             self.current_experiences.append({
                 "player_pokemon": state.player_pokemon.numpy(),
                 "opponent_pokemon": state.opponent_pokemon.numpy(),
@@ -140,7 +175,7 @@ def worker_process(
                 "action": action_idx,
                 "log_prob": log_prob_val,
                 "value": value_val,
-                "reward": reward,
+                "reward": 0.0,  # Will be filled when we see the result
                 "done": False,
             })
 
@@ -159,11 +194,14 @@ def worker_process(
                 self._won = None
 
             if self.current_experiences:
-                self.current_experiences[-1]["reward"] = final_reward
+                # Add terminal reward to the last experience
+                self.current_experiences[-1]["reward"] += final_reward
                 self.current_experiences[-1]["done"] = True
 
             self.prev_hp_fraction = None
             self.prev_opp_hp_fraction = None
+            self.prev_our_fainted = 0
+            self.prev_opp_fainted = 0
 
         def get_experiences(self):
             exps = self.current_experiences.copy()
@@ -174,6 +212,8 @@ def worker_process(
             self.current_experiences = []
             self.prev_hp_fraction = None
             self.prev_opp_hp_fraction = None
+            self.prev_our_fainted = 0
+            self.prev_opp_fainted = 0
             self._won = None
 
     class SelfPlayOpponent(Player):
@@ -237,13 +277,27 @@ def worker_process(
             players.append(player)
 
             # Create appropriate opponent
-            if opp_type == "max_damage":
+            # "best" type uses either MaxDamage (no weights) or neural net (with weights)
+            if opp_type == "best" and opponent_weights is not None:
+                # Best checkpoint exists - use neural network opponent
+                opponent = SelfPlayOpponent(
+                    model=opponent_network,
+                    state_encoder=encoder,
+                    dev=device,
+                    battle_format=battle_format,
+                    max_concurrent_battles=1,
+                    server_configuration=server_config,
+                )
+            elif opp_type == "max_damage" or (opp_type == "best" and opponent_weights is None):
+                # No best checkpoint yet, or explicit MaxDamage - use MaxDamage
                 opponent = MaxDamagePlayer(
                     battle_format=battle_format,
                     max_concurrent_battles=1,
                     server_configuration=server_config,
                 )
+                env_opponent_types[i] = "max_damage"
             elif opp_type == "self_play" and opponent_weights is not None:
+                # Legacy self-play support
                 opponent = SelfPlayOpponent(
                     model=opponent_network,
                     state_encoder=encoder,
@@ -253,7 +307,7 @@ def worker_process(
                     server_configuration=server_config,
                 )
             else:
-                # Fallback to max_damage if no self-play weights
+                # Fallback to max_damage
                 opponent = MaxDamagePlayer(
                     battle_format=battle_format,
                     max_concurrent_battles=1,
@@ -364,12 +418,14 @@ class MultiProcessTrainer:
         server_ports: list[int],
         device: torch.device,
         config: TrainingConfig,
+        benchmark_games: int = 50,
     ):
         self.num_workers = num_workers
         self.envs_per_worker = envs_per_worker
         self.server_ports = server_ports
         self.device = device
         self.config = config
+        self.benchmark_games = benchmark_games
 
         # Import here to ensure proper initialization
         from showdown_bot.models.network import PolicyValueNetwork
@@ -412,6 +468,17 @@ class MultiProcessTrainer:
         self.total_episodes = 0
         self.total_updates = 0
         self.best_bench_rate = 0.0
+        self.last_bench_rate = None  # From periodic evaluation
+        self.last_best_eval_rate = None  # Win rate vs best checkpoint
+        self.prev_best_bench = None  # Bench% when best_model was last promoted (for bench-gated promotion)
+
+        # Best checkpoint for "current vs best" training
+        # If no best exists, we train against MaxDamage until we beat it
+        self.save_dir = Path("data/checkpoints")
+        self.best_checkpoint_path = self.save_dir / "best_model.pt"
+
+        # Rolling win rate tracker for real-time display
+        self._rolling_results: deque[bool] = deque(maxlen=100)
 
         # Process management
         self.workers = []
@@ -472,47 +539,34 @@ class MultiProcessTrainer:
         print("All workers stopped")
 
     def get_opponent_types(self) -> list[str]:
-        """Get opponent types based on curriculum."""
-        self_play_ratio, max_damage_ratio, _ = self.self_play_manager.get_curriculum_ratios()
+        """Get opponent types for training - 100% vs best.
 
-        types = []
+        'best' means either:
+        - MaxDamage (if no best checkpoint exists yet)
+        - The best checkpoint (once we've beaten MaxDamage)
+        """
         total_envs = self.num_workers * self.envs_per_worker
+        return ["best"] * total_envs
 
-        # Distribute opponent types across all envs
-        num_self_play = int(total_envs * self_play_ratio)
-        num_max_damage = total_envs - num_self_play
+    def has_best_checkpoint(self) -> bool:
+        """Check if a best checkpoint exists."""
+        return self.best_checkpoint_path.exists()
 
-        types.extend(["self_play"] * num_self_play)
-        types.extend(["max_damage"] * num_max_damage)
+    def get_best_opponent_weights(self) -> dict | None:
+        """Get weights for the 'best' opponent.
 
-        # Shuffle to distribute evenly
-        import random
-        random.shuffle(types)
-
-        return types
-
-    def get_self_play_opponent_weights(self) -> dict | None:
-        """Get weights for self-play opponent from pool."""
-        if self.self_play_manager.opponent_pool.size == 0:
+        Returns:
+            - None if no best checkpoint (workers will use MaxDamage)
+            - Checkpoint weights if best_model.pt exists
+        """
+        if not self.has_best_checkpoint():
             return None
 
-        # Sample an opponent from the pool
-        opponent_info = self.self_play_manager.opponent_pool.sample_opponent(
-            strategy="diverse",
-            current_skill=self.self_play_manager.agent_skill,
-        )
-        if opponent_info is None:
-            return None
-
-        # Load weights from checkpoint file
-        checkpoint = torch.load(
-            opponent_info.checkpoint_path,
-            map_location="cpu",
-            weights_only=True,
-        )
+        # Load best checkpoint weights
+        checkpoint = torch.load(self.best_checkpoint_path, map_location=self.device, weights_only=False)
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-            return checkpoint["model_state_dict"]
-        return checkpoint
+            return {k: v.cpu() for k, v in checkpoint["model_state_dict"].items()}
+        return {k: v.cpu() for k, v in checkpoint.items()}
 
     def broadcast_tasks(self, opponent_types: list[str], opponent_weights: dict | None):
         """Send tasks to all workers."""
@@ -548,6 +602,151 @@ class MultiProcessTrainer:
 
         return results
 
+    def run_promotion_evaluation(self, num_games: int = 100) -> tuple[float | None, list[dict]]:
+        """Run evaluation games against the 'best' opponent for promotion decision.
+
+        If no best checkpoint exists, evaluates against MaxDamage.
+        If best checkpoint exists, evaluates against that checkpoint.
+
+        Args:
+            num_games: Number of evaluation games to run
+
+        Returns:
+            Tuple of (win_rate, experiences):
+            - win_rate: Win rate against best (0.0 to 1.0), or None if failed
+            - experiences: List of experience dicts from evaluation games
+        """
+        if self._shutdown_requested:
+            return None, []
+
+        # Send evaluation task to first worker only
+        model_weights = {k: v.cpu() for k, v in self.network.state_dict().items()}
+
+        # Get best opponent weights (None means use MaxDamage)
+        opponent_weights = self.get_best_opponent_weights()
+
+        # All games vs best
+        eval_opponent_types = ["best"] * self.envs_per_worker
+
+        task = {
+            "model_weights": model_weights,
+            "opponent_types": eval_opponent_types,
+            "opponent_weights": opponent_weights,
+        }
+
+        wins = 0
+        total = 0
+        all_experiences = []
+
+        # Run multiple batches to get num_games
+        games_per_batch = self.envs_per_worker
+        batches_needed = (num_games + games_per_batch - 1) // games_per_batch
+
+        for _ in range(batches_needed):
+            if self._shutdown_requested:
+                break
+
+            # Send task to first worker
+            self.task_queues[0].put(task)
+
+            # Wait for result
+            try:
+                result = self.result_queue.get(timeout=120.0)
+
+                # Collect experiences from evaluation games
+                all_experiences.extend(result.get("experiences", []))
+
+                for won, opp_type in result.get("battle_results", []):
+                    if won is not None:
+                        total += 1
+                        if won:
+                            wins += 1
+
+                    if total >= num_games:
+                        break
+            except Empty:
+                continue
+
+            if total >= num_games:
+                break
+
+        if total == 0:
+            return None, all_experiences
+
+        return wins / total, all_experiences
+
+    def run_benchmark_evaluation(self, num_games: int = 50) -> tuple[float | None, list[dict]]:
+        """Run evaluation games against MaxDamage and collect experiences.
+
+        This provides the Bench% metric AND returns experiences for training.
+        Runs games using one worker.
+
+        Args:
+            num_games: Number of evaluation games to run
+
+        Returns:
+            Tuple of (win_rate, experiences):
+            - win_rate: Win rate against MaxDamage (0.0 to 1.0), or None if failed
+            - experiences: List of experience dicts from benchmark games
+        """
+        if self._shutdown_requested:
+            return None, []
+
+        # Send evaluation task to first worker only
+        model_weights = {k: v.cpu() for k, v in self.network.state_dict().items()}
+
+        # All games vs MaxDamage
+        eval_opponent_types = ["max_damage"] * self.envs_per_worker
+
+        task = {
+            "model_weights": model_weights,
+            "opponent_types": eval_opponent_types,
+            "opponent_weights": None,  # Not needed for MaxDamage
+        }
+
+        wins = 0
+        total = 0
+        all_experiences = []
+
+        # Run multiple batches to get num_games
+        games_per_batch = self.envs_per_worker
+        batches_needed = (num_games + games_per_batch - 1) // games_per_batch
+
+        for _ in range(batches_needed):
+            if self._shutdown_requested:
+                break
+
+            # Send task to first worker
+            self.task_queues[0].put(task)
+
+            # Wait for result
+            try:
+                result = self.result_queue.get(timeout=120.0)
+
+                # Collect experiences from benchmark games
+                all_experiences.extend(result.get("experiences", []))
+
+                for won, opp_type in result.get("battle_results", []):
+                    if opp_type == "max_damage" and won is not None:
+                        total += 1
+                        if won:
+                            wins += 1
+                        # Update self-play manager's tracking
+                        self.self_play_manager.update_after_game(None, won, "max_damage")
+
+                    if total >= num_games:
+                        break
+            except Empty:
+                continue
+
+            if total >= num_games:
+                break
+
+        if total == 0:
+            return None, all_experiences
+
+        return wins / total, all_experiences
+
     def train(
         self,
         total_timesteps: int,
@@ -556,9 +755,10 @@ class MultiProcessTrainer:
     ):
         """Main training loop."""
         from torch.utils.tensorboard import SummaryWriter
-        from showdown_bot.training.trainer import TrainingDisplay
+        from showdown_bot.training.trainer import TrainingDisplay, MemoryMonitor
 
         save_path = Path(save_dir)
+        memory_monitor = MemoryMonitor()
         save_path.mkdir(parents=True, exist_ok=True)
         writer = SummaryWriter(log_dir)
 
@@ -581,7 +781,10 @@ class MultiProcessTrainer:
         print(f"Server ports: {self.server_ports}")
         print(f"Starting from: {self.total_timesteps:,}")
         print(f"Target: {target_timesteps:,}")
-        print(f"Self-play: Enabled")
+        if self.has_best_checkpoint():
+            print(f"Training: Current vs Best checkpoint")
+        else:
+            print(f"Training: Current vs MaxDamage (no best checkpoint yet)")
         print(f"{'='*60}\n")
 
         self.start_workers()
@@ -595,14 +798,26 @@ class MultiProcessTrainer:
 
         last_checkpoint_timesteps = self.total_timesteps
 
+        # Early checkpoint schedule: more frequent evaluations to avoid training too long on bad bot
+        # Checkpoints at: 25k, 50k, 100k, 150k, 200k, then every 100k after
+        early_checkpoints = [25000, 50000, 100000, 150000, 200000]
+
+        def get_next_checkpoint(current_steps: int) -> int:
+            """Get the next checkpoint timestep."""
+            for cp in early_checkpoints:
+                if current_steps < cp:
+                    return cp
+            # After early phase, checkpoint every 100k
+            return ((current_steps // 100000) + 1) * 100000
+
         try:
             while self.total_timesteps < target_timesteps and not self._shutdown_requested:
                 # Reset buffer
                 self.buffer.reset()
 
-                # Get opponent configuration from curriculum
+                # Get opponent configuration - current vs best
                 opponent_types = self.get_opponent_types()
-                opponent_weights = self.get_self_play_opponent_weights()
+                opponent_weights = self.get_best_opponent_weights()
 
                 # Set model to eval for inference
                 self.network.eval()
@@ -643,6 +858,9 @@ class MultiProcessTrainer:
                     for won, opp_type in result["battle_results"]:
                         self.self_play_manager.update_after_game(None, won, opp_type)
                         self.total_episodes += 1
+                        # Track rolling win rate
+                        if won is not None:
+                            self._rolling_results.append(won)
 
                 self.total_timesteps += total_steps
 
@@ -665,29 +883,18 @@ class MultiProcessTrainer:
 
                 self.total_updates += 1
 
-                # Maybe add to opponent pool
-                if self.self_play_manager.should_add_checkpoint(self.total_timesteps):
-                    self.self_play_manager.add_checkpoint(
-                        self.network,
-                        self.total_timesteps,
-                    )
+                # Note: Opponent pool disabled - using true self-play (current model vs itself)
+                # Historical checkpoints are not used for opponents
 
                 # Get stats for display
-                sp_stats = self.self_play_manager.get_stats()
-                bench_rate = sp_stats.get("rolling_win_rate_max_damage")
-                win_rates = self.self_play_manager.get_rolling_win_rates()
-                overall_win_rate = 0.0
-                total_games = 0
-                for opp_type, rate in win_rates.items():
-                    if rate is not None:
-                        overall_win_rate += rate
-                        total_games += 1
-                if total_games > 0:
-                    overall_win_rate /= total_games
+                # Use rolling win rate from training games (last 100)
+                if self._rolling_results:
+                    overall_win_rate = sum(self._rolling_results) / len(self._rolling_results)
+                else:
+                    overall_win_rate = 0.0
 
-                # Update best bench rate
-                if bench_rate is not None and bench_rate > self.best_bench_rate:
-                    self.best_bench_rate = bench_rate
+                # Use last benchmark result for bench_rate display
+                bench_rate = self.last_bench_rate
 
                 # Update display
                 display.update(
@@ -709,18 +916,113 @@ class MultiProcessTrainer:
                     writer.add_scalar("train/policy_loss", ppo_stats.policy_loss, self.total_timesteps)
                     writer.add_scalar("train/value_loss", ppo_stats.value_loss, self.total_timesteps)
                     writer.add_scalar("train/entropy", ppo_stats.entropy_loss, self.total_timesteps)
+                    writer.add_scalar("train/explained_variance", ppo_stats.explained_variance, self.total_timesteps)
+                    writer.add_scalar("train/clip_fraction", ppo_stats.clip_fraction, self.total_timesteps)
+                    writer.add_scalar("train/approx_kl", ppo_stats.approx_kl, self.total_timesteps)
                     writer.add_scalar("rollout/win_rate", overall_win_rate, self.total_timesteps)
                     if bench_rate is not None:
                         writer.add_scalar("rollout/bench_win_rate", bench_rate, self.total_timesteps)
 
-                # Save checkpoint periodically
-                if self.total_timesteps - last_checkpoint_timesteps >= 50000:
+                # Save checkpoint and run evaluation periodically
+                # Early training: 25k, 50k, 100k, 150k, 200k; then every 100k
+                next_checkpoint = get_next_checkpoint(last_checkpoint_timesteps)
+                if self.total_timesteps >= next_checkpoint:
                     self.save_checkpoint(save_path / "latest.pt")
                     last_checkpoint_timesteps = self.total_timesteps
 
-                    # Save best model
-                    if bench_rate is not None and bench_rate >= self.best_bench_rate:
-                        self.save_checkpoint(save_path / "best_model.pt")
+                    # Run MaxDamage benchmark at every checkpoint
+                    # Experiences are added to training buffer
+                    print(f"\nRunning MaxDamage benchmark ({self.benchmark_games} games)...")
+                    bench_rate_eval, bench_experiences = self.run_benchmark_evaluation(num_games=self.benchmark_games)
+                    if bench_rate_eval is not None:
+                        self.last_bench_rate = bench_rate_eval
+                        bench_rate = bench_rate_eval
+                        print(f"Bench%: {bench_rate:.1%} vs MaxDamage")
+                        writer.add_scalar("eval/bench_win_rate", bench_rate, self.total_timesteps)
+                        if bench_rate > self.best_bench_rate:
+                            self.best_bench_rate = bench_rate
+
+                    # Add benchmark experiences to training buffer (don't waste them)
+                    for exp in bench_experiences:
+                        if self.buffer.ptr < self.buffer.buffer_size:
+                            self.buffer.add(
+                                player_pokemon=exp["player_pokemon"][np.newaxis, ...],
+                                opponent_pokemon=exp["opponent_pokemon"][np.newaxis, ...],
+                                player_active_idx=np.array([exp["player_active_idx"]]),
+                                opponent_active_idx=np.array([exp["opponent_active_idx"]]),
+                                field_state=exp["field_state"][np.newaxis, ...],
+                                action_mask=exp["action_mask"][np.newaxis, ...],
+                                action=np.array([exp["action"]]),
+                                log_prob=np.array([exp["log_prob"]]),
+                                reward=np.array([exp["reward"]]),
+                                done=np.array([exp["done"]]),
+                                value=np.array([exp["value"]]),
+                            )
+
+                    # Evaluate current vs best for promotion
+                    # If no best exists, this evaluates vs MaxDamage
+                    print("Running promotion evaluation vs best (200 games)...")
+                    eval_vs_best, promo_experiences = self.run_promotion_evaluation(num_games=200)
+
+                    # Add promotion eval experiences to training buffer
+                    for exp in promo_experiences:
+                        if self.buffer.ptr < self.buffer.buffer_size:
+                            self.buffer.add(
+                                player_pokemon=exp["player_pokemon"][np.newaxis, ...],
+                                opponent_pokemon=exp["opponent_pokemon"][np.newaxis, ...],
+                                player_active_idx=np.array([exp["player_active_idx"]]),
+                                opponent_active_idx=np.array([exp["opponent_active_idx"]]),
+                                field_state=exp["field_state"][np.newaxis, ...],
+                                action_mask=exp["action_mask"][np.newaxis, ...],
+                                action=np.array([exp["action"]]),
+                                log_prob=np.array([exp["log_prob"]]),
+                                reward=np.array([exp["reward"]]),
+                                done=np.array([exp["done"]]),
+                                value=np.array([exp["value"]]),
+                            )
+
+                    if eval_vs_best is not None:
+                        self.last_best_eval_rate = eval_vs_best
+                        opponent_name = "Best" if self.has_best_checkpoint() else "MaxDamage"
+                        print(f"vs {opponent_name}: {eval_vs_best:.1%}")
+                        writer.add_scalar("eval/vs_best_win_rate", eval_vs_best, self.total_timesteps)
+
+                        # Bench-gated promotion: must beat best AND maintain bench%
+                        # bench_threshold = max(floor, prev_best_bench - tolerance)
+                        bench_floor = 0.20  # Must be better than random
+                        bench_tolerance = 0.08  # Allow ~1 std dev variance
+                        prev_bench = self.prev_best_bench if self.prev_best_bench is not None else 0.0
+                        bench_threshold = max(bench_floor, prev_bench - bench_tolerance)
+
+                        # Check both conditions for promotion
+                        beats_best = eval_vs_best >= 0.30
+                        meets_bench = bench_rate_eval is not None and bench_rate_eval >= bench_threshold
+
+                        if beats_best and meets_bench:
+                            self.save_checkpoint(save_path / "best_model.pt")
+                            self.prev_best_bench = bench_rate_eval  # Update for next promotion
+                            print(f"Promoted! Current -> Best")
+                            print(f"  vs Best: {eval_vs_best:.1%} >= 30%")
+                            print(f"  Bench%: {bench_rate_eval:.1%} >= {bench_threshold:.1%} (floor={bench_floor:.0%}, prev={prev_bench:.1%})")
+                            writer.add_scalar("eval/promotion", 1.0, self.total_timesteps)
+                        elif beats_best and not meets_bench:
+                            print(f"Promotion BLOCKED - bench% too low")
+                            print(f"  vs Best: {eval_vs_best:.1%} >= 30% (passed)")
+                            print(f"  Bench%: {bench_rate_eval:.1%} < {bench_threshold:.1%} (failed)")
+                            writer.add_scalar("eval/promotion", 0.0, self.total_timesteps)
+                        else:
+                            writer.add_scalar("eval/promotion", 0.0, self.total_timesteps)
+
+                # Check memory usage
+                mem_status, mem_percent = memory_monitor.check_memory()
+                if mem_status == "hard_limit":
+                    print(f"\nMemory critical ({mem_percent:.1f}%), emergency shutdown!")
+                    self.save_checkpoint(save_path / "latest.pt")
+                    break
+                elif mem_status == "soft_limit":
+                    print(f"\nMemory high ({mem_percent:.1f}%), graceful shutdown...")
+                    self.save_checkpoint(save_path / "latest.pt")
+                    break
 
         finally:
             display.close()
@@ -746,6 +1048,8 @@ class MultiProcessTrainer:
                 "total_episodes": self.total_episodes,
                 "total_updates": self.total_updates,
                 "best_win_rate": self.best_bench_rate,
+                "last_bench_rate": self.last_bench_rate,
+                "prev_best_bench": self.prev_best_bench,  # For bench-gated promotion
             },
             "self_play": {
                 "agent_skill": self.self_play_manager.agent_skill,
@@ -755,6 +1059,7 @@ class MultiProcessTrainer:
                 "results_self_play": list(self.self_play_manager._results_self_play),
                 "results_max_damage": list(self.self_play_manager._results_max_damage),
                 "results_random": list(self.self_play_manager._results_random),
+                "rolling_results": list(self._rolling_results),
             },
             "config": {
                 "num_workers": self.num_workers,
@@ -778,6 +1083,8 @@ class MultiProcessTrainer:
         self.total_episodes = stats.get("total_episodes", 0)
         self.total_updates = stats.get("total_updates", 0)
         self.best_bench_rate = stats.get("best_win_rate", 0.0)
+        self.last_bench_rate = stats.get("last_bench_rate")
+        self.prev_best_bench = stats.get("prev_best_bench")  # For bench-gated promotion
 
         # Load self-play state
         sp_state = checkpoint.get("self_play", {})
@@ -797,6 +1104,11 @@ class MultiProcessTrainer:
                 self.self_play_manager._results_self_play = deque(
                     sp_state["results_self_play"],
                     maxlen=self.self_play_manager._rolling_window,
+                )
+            if "rolling_results" in sp_state:
+                self._rolling_results = deque(
+                    sp_state["rolling_results"],
+                    maxlen=100,
                 )
 
         print(f"Loaded: {path}")
@@ -822,6 +1134,12 @@ def main():
     parser.add_argument("--log-dir", type=str, default="runs")
     parser.add_argument("--device", type=str, default="cuda",
                         help="Device: cuda or cpu")
+    parser.add_argument("--self-play-start", action="store_true",
+                        help="Start with self-play instead of MaxDamage (copies initial model as best)")
+    parser.add_argument("--entropy-coef", type=float, default=0.05,
+                        help="Entropy coefficient for exploration (default: 0.05)")
+    parser.add_argument("--benchmark-games", type=int, default=50,
+                        help="Number of MaxDamage benchmark games per checkpoint (default: 50)")
 
     args = parser.parse_args()
 
@@ -834,6 +1152,10 @@ def main():
     print(f"Device: {device}")
 
     config = TrainingConfig()
+    # Override entropy_coef if specified via CLI
+    config.entropy_coef = args.entropy_coef
+    print(f"Entropy coef: {config.entropy_coef}")
+    print(f"Benchmark games: {args.benchmark_games}")
 
     trainer = MultiProcessTrainer(
         num_workers=args.workers,
@@ -841,10 +1163,25 @@ def main():
         server_ports=args.server_ports,
         device=device,
         config=config,
+        benchmark_games=args.benchmark_games,
     )
 
     if args.resume:
         trainer.load_checkpoint(args.resume)
+
+    # If --self-play-start is set and not resuming, create best_model.pt from initial weights
+    # This makes training start as "current vs current" instead of "current vs MaxDamage"
+    if args.self_play_start and not args.resume:
+        best_path = Path(args.save_dir) / "best_model.pt"
+        if not best_path.exists():
+            best_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({
+                "model_state_dict": trainer.network.state_dict(),
+            }, best_path)
+            print(f"Self-play start: Created initial best_model.pt")
+            print(f"Training will be: Current vs Current (not MaxDamage)")
+        else:
+            print(f"Warning: best_model.pt already exists, --self-play-start has no effect")
 
     trainer.train(
         total_timesteps=args.timesteps,
